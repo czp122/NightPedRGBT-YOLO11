@@ -15,12 +15,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed with exit code $LASTEXITCODE"
 }
 
-$bundledModel = Join-Path $dist "NightPedestrianDetection\_internal\models\best.pt"
 $runtimeModel = Join-Path $dist "NightPedestrianDetection\_internal\models\rgbt_best.pt"
-if (-not (Test-Path -LiteralPath $bundledModel)) {
-    throw "Bundled RGBT model not found: $bundledModel"
+if (-not (Test-Path -LiteralPath $runtimeModel)) {
+    throw "Bundled RGBT model not found: $runtimeModel"
 }
-Move-Item -LiteralPath $bundledModel -Destination $runtimeModel -Force
+
+Copy-Item `
+    -LiteralPath (Join-Path $root "packaging\使用说明.txt") `
+    -Destination (Join-Path $dist "NightPedestrianDetection\使用说明.txt") `
+    -Force
 
 if (Test-Path -LiteralPath $zip) {
     Remove-Item -LiteralPath $zip -Force

@@ -4,9 +4,8 @@ from pathlib import Path
 root = Path(SPECPATH)
 datas = [
     (str(root / "yolo11n.pt"), "."),
-    (str(root / "packaging" / "使用说明.txt"), "."),
     (
-        str(root / "runs" / "rgbt_yolo11n_cbam11_ft8002" / "weights" / "best.pt"),
+        str(root / "models" / "rgbt_best.pt"),
         "models",
     ),
 ]

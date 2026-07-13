@@ -17,16 +17,43 @@ def ensure_3ch(im: np.ndarray | None) -> np.ndarray | None:
     return im
 
 
-def preprocess_ir_for_model(ir_bgr: np.ndarray | None) -> np.ndarray | None:
-    """Apply the thesis IR preprocessing path: grayscale, NLM denoise, CLAHE, then 3ch."""
+def preprocess_ir_for_model(
+    ir_bgr: np.ndarray | None,
+    realtime: bool = False,
+    realtime_max_side: int = 320,
+) -> np.ndarray | None:
+    """Apply grayscale, NLM denoising and CLAHE; realtime mode reduces video latency."""
     ir = ensure_3ch(ir_bgr)
     if ir is None:
         return None
 
     gray = cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
+    work = gray
+    if realtime and max(gray.shape) > realtime_max_side:
+        scale = realtime_max_side / max(gray.shape)
+        work = cv2.resize(
+            gray,
+            (max(1, int(gray.shape[1] * scale)), max(1, int(gray.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    template_window = 5 if realtime else 7
+    search_window = 15 if realtime else 21
+    denoised = cv2.fastNlMeansDenoising(
+        work,
+        None,
+        h=5,
+        templateWindowSize=template_window,
+        searchWindowSize=search_window,
+    )
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(denoised)
+    if enhanced.shape != gray.shape:
+        enhanced = cv2.resize(
+            enhanced,
+            (gray.shape[1], gray.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
 

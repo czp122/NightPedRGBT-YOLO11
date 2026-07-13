@@ -8,8 +8,10 @@
    - 没有外接摄像头时，自动使用电脑内置前置摄像头和3通道模型。
 4. 红外摄像头名称无法自动判断时，使用“手动RGB+IR”，分别输入RGB和IR摄像头编号。
 5. 请在 Windows 设置中允许桌面应用访问摄像头，并关闭可能占用摄像头的其他程序。
-6. 当前发布包为 Windows 10/11 64位 CPU 运行版。imgsz 推荐384，倍速推荐1.0。
-7. 图片结果默认保存到“本地应用数据\NightPedRGBT\runs\gui_results”。
+6. device 保持 auto：程序优先使用打包环境中可用的 NVIDIA CUDA GPU，否则自动使用 CPU。
+7. 状态栏会显示实际设备、检测耗时和 FPS；若只显示 CPU，说明当前发布包不含 CUDA 版 PyTorch 或电脑无可用 NVIDIA GPU。
+8. 6通道视频在 CPU 上推荐 imgsz=320 或 384、倍速=1.0；GPU 可从 imgsz=384 开始测试。
+9. 图片结果默认保存到“本地应用数据\NightPedRGBT\runs\gui_results”。
 
 内置模型：
 - RGB 3通道：yolo11n.pt

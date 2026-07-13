@@ -2,10 +2,10 @@
 
 This project is an **Ultralytics official YOLO11** baseline (model YAML compatible with `yolo11n.yaml`), with a **minimal-intrusion patch**:
 
-- 鉁?**CBAM attention**: added as a new module `CBAM` and a drop-in block `C3k2CBAM`.
-- 鉁?**YAML insertion**: in `configs/yolo11n_llvip_rgbt_cbam.yaml` we replace `C3k2` with `C3k2CBAM` (Channel+Spatial attention) so CBAM is *actually in the graph*.
-- 鉁?**LLVIP RGBT dynamic pairing**: **no fused images saved**. Visible+Infrared are loaded on-the-fly and concatenated into **6 channels (BGR + IR*3)**.
-- 鉁?**One-click train** from PyCharm green run: all frequently-changed paths/params are in `.env`.
+- **CBAM attention**: added as a new module `CBAM` and a drop-in block `C3k2CBAM`.
+- **YAML insertion**: in `configs/yolo11n_llvip_rgbt_cbam.yaml` we replace `C3k2` with `C3k2CBAM` (Channel+Spatial attention) so CBAM is *actually in the graph*.
+- **LLVIP RGBT dynamic pairing**: **no fused images saved**. Visible+Infrared are loaded on-the-fly and concatenated into **6 channels (BGR + IR*3)**.
+- **One-click train** from PyCharm: all frequently-changed paths/params are in `.env`.
 
 ## 1. Dataset layout (expected)
 
@@ -40,7 +40,7 @@ pip install -r requirements.txt
 4) Run training:
 
 - Open `scripts/train.py`
-- Click PyCharm green 鈻讹笍 to run
+- Click the PyCharm green Run button
 
 The script will:
 - auto-generate `runs/llvip_rgbt_data.yaml`
@@ -98,4 +98,29 @@ We also patch `RandomHSV` so HSV augmentation only affects the **visible 3 chann
 
 - 6-channel input **cannot directly use** official pretrained weights (3-channel). Training uses `pretrained=False`.
 - If your infrared images are single-channel, the patch repeats to 3ch automatically.
+
+## 6. Runtime acceleration
+
+The GUI device selector defaults to `auto`:
+
+- NVIDIA CUDA is available: use GPU 0, FP16 inference, cuDNN benchmark and TF32 automatically.
+- CUDA is unavailable: use CPU automatically, with bounded PyTorch/OpenCV thread counts to avoid thread contention.
+- CUDA inference fails or runs out of memory: clear the CUDA cache, reset the predictor and retry on CPU.
+- The status bar displays the actual device, inference latency and runtime FPS.
+
+Run the source version:
+
+```powershell
+.\.venv\Scripts\python.exe gui\app.py
+```
+
+On a computer with a supported NVIDIA GPU and driver, install the CUDA-enabled PyTorch build that matches this project:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_cuda_acceleration.ps1
+```
+
+Then start the GUI and keep `device=auto`. A self-contained EXE only includes the PyTorch runtime present when it was built. To create a GPU-capable EXE, run the CUDA installation script first and then run `build_exe.ps1` on the NVIDIA computer.
+
+For 6-channel video on CPU, realtime IR preprocessing uses a reduced NLM search area while preserving NLM denoising and CLAHE. Full-resolution preprocessing remains unchanged for dataset images and training.
 

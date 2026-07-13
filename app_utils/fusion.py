@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from app_utils.preprocess import build_rgbt_for_model, preprocess_ir_for_model
+from app_utils.preprocess import preprocess_ir_for_model
 
 
 def _ensure_3ch(im: np.ndarray) -> np.ndarray:
@@ -30,19 +30,14 @@ def _safe_clahe_bgr(im: np.ndarray, clahe) -> np.ndarray:
 
 
 class FusionEngine:
-    def __init__(self, use_clahe: bool = True, use_gaussian: bool = True):
+    def __init__(self, use_clahe: bool = True):
         self.use_clahe = bool(use_clahe)
-        self.use_gaussian = bool(use_gaussian)
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if self.use_clahe else None
         print("[FusionEngine] Initialized (adaptive RGBT fusion enabled)")
 
-    def fuse(self, rgb, ir):
-        """兼容旧代码的接口，默认返回用于显示的 3 通道图像。"""
-        return self.for_display(rgb, ir)
-
-    def preprocess_ir(self, ir_bgr: np.ndarray) -> np.ndarray:
-        """# 优化：红外预处理增加高斯去噪 + CLAHE，对外接口保持不变。"""
-        return preprocess_ir_for_model(ir_bgr)
+    def preprocess_ir(self, ir_bgr: np.ndarray, realtime: bool = False) -> np.ndarray:
+        """Apply denoising and local contrast enhancement to an IR frame."""
+        return preprocess_ir_for_model(ir_bgr, realtime=realtime)
 
     @staticmethod
     def _align_modalities(rgb: np.ndarray, ir: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -92,13 +87,6 @@ class FusionEngine:
         w_ir = 1.0 - w_rgb
         return w_rgb, w_ir
 
-    def for_model(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
-        """
-        生成 6 通道数据供 YOLO 推理。
-        返回: (H, W, 6)
-        """
-        return build_rgbt_for_model(rgb_bgr, ir_bgr)
-
     def for_model_with_preprocessed_ir(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
         """Use an already-preprocessed IR image to avoid duplicate denoising/CLAHE work."""
         rgb = _ensure_3ch(rgb_bgr)
@@ -108,15 +96,6 @@ class FusionEngine:
         if ir.shape[:2] != rgb.shape[:2]:
             ir = cv2.resize(ir, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
         return np.concatenate([rgb, ir], axis=2)
-
-    def for_display(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
-        """
-        生成 3 通道伪彩融合图供人眼观看。
-        返回: (H, W, 3)
-        """
-        rgb = _ensure_3ch(rgb_bgr)
-        ir = self.preprocess_ir(ir_bgr)
-        return self.for_display_with_preprocessed_ir(rgb, ir)
 
     def for_display_with_preprocessed_ir(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
         """Build the display fusion image using an already-preprocessed IR image."""

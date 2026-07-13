@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import time
 import threading
@@ -9,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import cv2
+import torch
 from PIL import Image, ImageTk
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +25,15 @@ OUTPUT_ROOT = (
     else Path(PROJECT_ROOT)
 )
 
+from app_utils.acceleration import (
+    ComputeDevice,
+    available_device_options,
+    clear_cuda_cache,
+    configure_compute_runtime,
+    is_cuda_runtime_error,
+    resolve_compute_device,
+    synchronize_if_cuda,
+)
 from app_utils.camera import CameraDevice, choose_auto_camera_setup, discover_cameras
 from app_utils.data_loader import DatasetManager
 from app_utils.fusion import FusionEngine
@@ -40,6 +51,8 @@ class MainApp:
         self.root.geometry("1500x900")
         self.root.minsize(1200, 700)
 
+        self.cpu_threads = configure_compute_runtime()
+        self.active_device = resolve_compute_device("auto", self.cpu_threads)
         self.data_manager = None
         self.fusion_engine = FusionEngine()
         self.models = {}
@@ -50,7 +63,7 @@ class MainApp:
         self.path_var = tk.StringVar(value="")
         self.split_var = tk.StringVar(value="test")
         self.model_var = tk.StringVar(value="")
-        self.device_var = tk.StringVar(value="cpu")
+        self.device_var = tk.StringVar(value="auto")
         self.imgsz_var = tk.IntVar(value=384)
         self.conf_var = tk.DoubleVar(value=0.25)
         self.iou_var = tk.DoubleVar(value=0.45)
@@ -60,7 +73,12 @@ class MainApp:
         self._lock = threading.Lock()
         self._worker = None
         self._img_refs = {}
-        self._video_ui_pending = False
+        self._ui_tasks = queue.SimpleQueue()
+        self._video_ui_lock = threading.Lock()
+        self._video_ui_payload = None
+        self._closing = False
+        self._fps_ema = 0.0
+        self.video_predict_settings = None
 
         self.video_worker = None
         self.video_running = False
@@ -80,22 +98,77 @@ class MainApp:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self._build_ui()
+        self.root.after(15, self._drain_ui_tasks)
+        self._apply_device_selection(log_selection=True)
         self._load_default_model_if_exist()
         self._set_no_image_all()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def log(self, s: str):
         print(s)
+        self._post_ui(self._append_log, str(s))
+
+    def _post_ui(self, callback, *args):
+        if self._closing:
+            return
+        if threading.current_thread() is threading.main_thread():
+            callback(*args)
+        else:
+            self._ui_tasks.put((callback, args))
+
+    def _drain_ui_tasks(self):
+        if self._closing:
+            return
         try:
-            self.root.after(0, lambda: self._append_log(str(s)))
-        except Exception:
-            pass
+            for _ in range(100):
+                try:
+                    callback, args = self._ui_tasks.get_nowait()
+                except queue.Empty:
+                    break
+                callback(*args)
+
+            with self._video_ui_lock:
+                payload = self._video_ui_payload
+                self._video_ui_payload = None
+            if payload is not None:
+                self._update_ui_images(*payload)
+        finally:
+            if not self._closing:
+                self.root.after(15, self._drain_ui_tasks)
 
     def _append_log(self, s: str):
         self.log_text.config(state="normal")
         self.log_text.insert("end", s + "\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+
+    def _apply_device_selection(self, event=None, log_selection: bool = True):
+        previous = self.active_device
+        selected = resolve_compute_device(self.device_var.get(), self.cpu_threads)
+        device_changed = previous.predict_arg != selected.predict_arg
+        restart_video = device_changed and self.video_running
+        if restart_video:
+            self.stop_video()
+
+        self.active_device = selected
+        if device_changed:
+            for model in self.models.values():
+                model.predictor = None
+
+        if selected.fallback_reason:
+            self.log(f"[ACCEL] {selected.fallback_reason}")
+        if log_selection:
+            self.log(f"[ACCEL] 当前推理设备: {selected.label}")
+        if restart_video:
+            self.log("[ACCEL] 推理设备已改变，正在重新开始视频")
+            self.start_video_inference()
+
+    def _read_predict_settings(self) -> dict:
+        return {
+            "imgsz": max(32, int(self.imgsz_var.get())),
+            "conf": max(0.01, float(self.conf_var.get())),
+            "iou": max(0.01, float(self.iou_var.get())),
+        }
 
     def _build_ui(self):
         top = tk.Frame(self.root, bg="#eaeaea", pady=6)
@@ -132,13 +205,15 @@ class MainApp:
         tk.Button(top, text="+ 加载模型(.pt)", command=self.load_custom_model).pack(side=tk.LEFT, padx=4)
 
         tk.Label(top, text="device:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
-        ttk.Combobox(
+        self.device_combo = ttk.Combobox(
             top,
             textvariable=self.device_var,
-            values=["cpu", "0", "1"],
-            width=6,
+            values=available_device_options(),
+            width=7,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.device_combo.pack(side=tk.LEFT, padx=4)
+        self.device_combo.bind("<<ComboboxSelected>>", self._apply_device_selection)
 
         for text, var in (("imgsz", self.imgsz_var), ("conf", self.conf_var), ("iou", self.iou_var)):
             tk.Label(top, text=f"{text}:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
@@ -400,44 +475,28 @@ class MainApp:
         if not p:
             return
         try:
+            restart_video = self.video_running
+            if restart_video:
+                self.stop_video()
             self._register_model(p)
-            self.process_current_image_async()
+            if restart_video:
+                self.start_video_inference()
+            else:
+                self.process_current_image_async()
         except Exception as e:
             messagebox.showerror("错误", f"模型加载失败：\n{e}")
 
 
     def on_model_change(self, event):
         if self.model_var.get() in self.models:
+            restart_video = self.video_running
+            if restart_video:
+                self.stop_video()
             self.current_model = self.models[self.model_var.get()]
-            ch = self._current_model_channels()
-            if self.video_running and self.stream_mode == "camera_rgb" and ch != 3:
-                self.stop_video()
-                messagebox.showwarning(
-                    "提示",
-                    "单个可见光摄像头只能使用3通道模型，实时推理已停止。"
-                )
-                return
-            if self.video_running and self.stream_mode == "camera_rgbt" and ch < 6:
-                self.stop_video()
-                messagebox.showwarning(
-                    "提示",
-                    "RGB+IR双摄像头需要6通道模型，实时推理已停止。"
-                )
-                return
-            if self.video_running and ch >= 6:
-                if self.video_source is None or self.ir_video_source is None:
-                    self.stop_video()
-                    messagebox.showwarning(
-                        "提示",
-                        "当前已切换到6通道模型，缺少红外视频，已自动停止视频推理。\n请先加载IR视频后再开始。"
-                    )
-                elif self.video_source == self.ir_video_source:
-                    self.stop_video()
-                    messagebox.showwarning(
-                        "提示",
-                        "当前已切换到6通道模型，但RGB和IR是同一个视频，已自动停止视频推理。\n请加载真实配对的IR视频后再开始。"
-                    )
-            self.process_current_image_async()
+            if restart_video:
+                self.start_video_inference()
+            else:
+                self.process_current_image_async()
 
     def next_img(self):
         if self.data_manager and self.data_manager.current_data:
@@ -452,10 +511,15 @@ class MainApp:
     def process_current_image_async(self):
         if self._worker and self._worker.is_alive():
             return
-        self._worker = threading.Thread(target=self.process_current_image, daemon=True)
+        predict_settings = self._read_predict_settings()
+        self._worker = threading.Thread(
+            target=self.process_current_image,
+            args=(predict_settings,),
+            daemon=True,
+        )
         self._worker.start()
 
-    def process_current_image(self):
+    def process_current_image(self, predict_settings=None):
         with self._lock:
             if not self.data_manager or not self.data_manager.current_data:
                 return
@@ -463,7 +527,14 @@ class MainApp:
             if not item:
                 return
             rgb, ir, gt_boxes, fname = item
-            self._infer_and_update(rgb, ir, gt_boxes, fname, len(self.data_manager.current_data))
+            self._infer_and_update(
+                rgb,
+                ir,
+                gt_boxes,
+                fname,
+                len(self.data_manager.current_data),
+                predict_settings,
+            )
 
     def _draw_gt(self, image, boxes):
         h, w = image.shape[:2]
@@ -482,20 +553,40 @@ class MainApp:
             c += 1
         return c
 
-    def _draw_pred(self, image, input_tensor):
+    def _predict_once(self, input_tensor, settings: dict, device: ComputeDevice):
+        synchronize_if_cuda(device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            results = self.current_model.predict(
+                input_tensor,
+                device=device.predict_arg,
+                half=device.use_half,
+                imgsz=settings["imgsz"],
+                conf=settings["conf"],
+                iou=settings["iou"],
+                classes=[0],
+                verbose=False,
+            )
+        synchronize_if_cuda(device)
+        return results, (time.perf_counter() - t0) * 1000.0
+
+    def _draw_pred(self, image, input_tensor, predict_settings=None):
         if self.current_model is None:
             return 0.0, 0, []
-        t0 = time.time()
-        results = self.current_model.predict(
-            input_tensor,
-            device=self.device_var.get(),
-            imgsz=max(32, int(self.imgsz_var.get())),
-            conf=max(0.01, float(self.conf_var.get())),
-            iou=max(0.01, float(self.iou_var.get())),
-            classes=[0],
-            verbose=False,
-        )
-        dt = (time.time() - t0) * 1000.0
+        settings = predict_settings or {"imgsz": 384, "conf": 0.25, "iou": 0.45}
+        device = self.active_device
+        try:
+            results, dt = self._predict_once(input_tensor, settings, device)
+        except Exception as e:
+            if not device.is_cuda or not is_cuda_runtime_error(e):
+                raise
+            self.log(f"[ACCEL] GPU推理失败，自动回退CPU: {e}")
+            clear_cuda_cache()
+            self.current_model.predictor = None
+            self.active_device = resolve_compute_device("cpu", self.cpu_threads)
+            self._post_ui(self.device_var.set, "cpu")
+            results, dt = self._predict_once(input_tensor, settings, self.active_device)
+
         c = 0
         det_logs = []
         if results and results[0].boxes is not None:
@@ -518,7 +609,7 @@ class MainApp:
                 c += 1
         return dt, c, det_logs
 
-    def _infer_and_update(self, rgb, ir, gt_boxes, fname, total):
+    def _infer_and_update(self, rgb, ir, gt_boxes, fname, total, predict_settings=None):
         ir_show = ir if ir.ndim == 3 else cv2.cvtColor(ir, cv2.COLOR_GRAY2BGR)
         t0 = time.time()
         ir_preprocessed = self.fusion_engine.preprocess_ir(ir)
@@ -530,14 +621,13 @@ class MainApp:
         det_ms, pred_count, det_logs = (0.0, 0, [])
         try:
             if model_input is not None:
-                det_ms, pred_count, det_logs = self._draw_pred(res, model_input)
+                det_ms, pred_count, det_logs = self._draw_pred(res, model_input, predict_settings)
         except Exception as e:
             self.log(f"[GUI] 推理出错: {e}")
         if det_logs:
             self.log("[PRED] " + "; ".join(det_logs))
         self.latest_result_frame = res.copy()
-        self.root.after(
-            0,
+        self._post_ui(
             self._update_ui_images,
             rgb,
             ir_show,
@@ -551,7 +641,20 @@ class MainApp:
             pred_count,
         )
 
-    def _update_ui_images(self, rgb, ir, fused, res, fname, total, fuse_ms, det_ms, gt_count, pred_count):
+    def _update_ui_images(
+        self,
+        rgb,
+        ir,
+        fused,
+        res,
+        fname,
+        total,
+        fuse_ms,
+        det_ms,
+        gt_count,
+        pred_count,
+        runtime_fps=0.0,
+    ):
         for img, label in [
             (rgb, self.lbl_rgb.inner_label),
             (ir, self.lbl_ir.inner_label),
@@ -567,22 +670,16 @@ class MainApp:
             idx_text = f"[{total}]"
         else:
             idx_text = f"[{self.curr_img_idx + 1}/{total}]"
+        fps_text = f" FPS:{runtime_fps:.1f}" if runtime_fps > 0 else ""
         self.info_var.set(
             f"{idx_text} {fname} | 模型:{m} ({mode}) | "
-            f"Fuse:{fuse_ms:.1f}ms Det:{det_ms:.1f}ms | GT:{gt_count} Pred:{pred_count}"
+            f"设备:{self.active_device.label} | Fuse:{fuse_ms:.1f}ms "
+            f"Det:{det_ms:.1f}ms{fps_text} | GT:{gt_count} Pred:{pred_count}"
         )
 
     def _schedule_video_ui_update(self, *args):
-        if self._video_ui_pending:
-            return
-        self._video_ui_pending = True
-        self.root.after(0, self._update_video_ui_images, *args)
-
-    def _update_video_ui_images(self, *args):
-        try:
-            self._update_ui_images(*args)
-        finally:
-            self._video_ui_pending = False
+        with self._video_ui_lock:
+            self._video_ui_payload = args
 
     def _show_image(self, cv_img, tk_label):
         if cv_img is None:
@@ -745,7 +842,12 @@ class MainApp:
     def stop_video(self):
         self.video_running = False
         self.video_paused = False
-        self._release_video_io()
+        worker = self.video_worker
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=3.0)
+        if worker is None or not worker.is_alive():
+            self.video_worker = None
+            self._release_video_io()
 
     def _release_video_io(self):
         for cap in (self.cap_vis, self.cap_ir):
@@ -809,15 +911,24 @@ class MainApp:
             return
 
         self.stop_video()
+        self.video_model_channels = ch
+        self.video_predict_settings = self._read_predict_settings()
+        self.video_speed = max(0.25, float(self.speed_var.get()))
         self.video_running = True
-        self._video_ui_pending = False
+        with self._video_ui_lock:
+            self._video_ui_payload = None
+        self._fps_ema = 0.0
+        self.log(
+            f"[ACCEL] 视频推理使用 {self.active_device.label} | "
+            f"imgsz={self.video_predict_settings['imgsz']}"
+        )
         self.video_worker = threading.Thread(target=self._video_loop, daemon=True)
         self.video_worker.start()
 
 
     def _video_loop(self):
         try:
-            ch = self._current_model_channels()
+            ch = self.video_model_channels
             use_ir = ch >= 6
             is_camera = self.stream_mode.startswith("camera_")
 
@@ -848,7 +959,7 @@ class MainApp:
                 ) or 1
             else:
                 total_frames = int(self.cap_vis.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or 1
-            delay = max(0.001, 1.0 / (fps * max(0.25, float(self.speed_var.get()))))
+            delay = max(0.001, 1.0 / (fps * self.video_speed))
             skip_accum = 0.0
 
             while self.video_running:
@@ -871,16 +982,20 @@ class MainApp:
                 fuse_t0 = time.time()
                 if use_ir:
                     ir_show = fi if fi.ndim == 3 else cv2.cvtColor(fi, cv2.COLOR_GRAY2BGR)
-                    ir_preprocessed = self.fusion_engine.preprocess_ir(fi)
+                    ir_preprocessed = self.fusion_engine.preprocess_ir(fi, realtime=True)
                     fused = self.fusion_engine.for_display_with_preprocessed_ir(fv, ir_preprocessed)
-                    model_input = self._model_input_with_preprocessed_ir(fv, ir_preprocessed)
+                    model_input = self.fusion_engine.for_model_with_preprocessed_ir(fv, ir_preprocessed)
                 else:
                     ir_show = None
                     fused = fv.copy()
                     model_input = fv
                 fuse_ms = (time.time() - fuse_t0) * 1000.0
                 res = fused.copy()
-                det_ms, pred_count, _det_logs = self._draw_pred(res, model_input)
+                det_ms, pred_count, _det_logs = self._draw_pred(
+                    res,
+                    model_input,
+                    self.video_predict_settings,
+                )
                 self.latest_result_frame = res.copy()
 
                 if self.output_path:
@@ -894,6 +1009,13 @@ class MainApp:
                         )
                     self.output_writer.write(res)
 
+                elapsed = time.time() - frame_t0
+                instant_fps = 1.0 / max(elapsed, 1e-6)
+                self._fps_ema = (
+                    instant_fps
+                    if self._fps_ema <= 0
+                    else 0.85 * self._fps_ema + 0.15 * instant_fps
+                )
                 self._schedule_video_ui_update(
                     fv,
                     ir_show,
@@ -905,8 +1027,8 @@ class MainApp:
                     det_ms,
                     0,
                     pred_count,
+                    self._fps_ema,
                 )
-                elapsed = time.time() - frame_t0
                 if elapsed < delay:
                     time.sleep(delay - elapsed)
                 elif not is_camera:
@@ -920,10 +1042,13 @@ class MainApp:
                             if not rv_skip or not ri_skip:
                                 break
         except Exception as e:
-            self.log(f"[GUI] 视频推理失败: {e}")
+            if self.video_running:
+                self.log(f"[GUI] 视频推理失败: {e}")
         finally:
             self.video_running = False
             self._release_video_io()
+            if self.video_worker is threading.current_thread():
+                self.video_worker = None
 
     def save_current_result(self):
         if self.latest_result_frame is None:
@@ -947,6 +1072,7 @@ class MainApp:
             self.log(f"[GUI] 图片结果已保存到: {p}")
 
     def _on_close(self):
+        self._closing = True
         self.stop_video()
         self.root.destroy()
 
