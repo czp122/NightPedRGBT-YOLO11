@@ -1,0 +1,11 @@
+.venv/
+.env
+.idea/
+__pycache__/
+*.pyc
+build/
+dist/
+runs/
+*.onnx
+.DS_Store
+Thumbs.db
