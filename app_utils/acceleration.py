@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+
 import cv2
 import torch
 

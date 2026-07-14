@@ -3,26 +3,41 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $root ".venv\Scripts\python.exe"
 $dist = Join-Path $root "dist"
-$build = Join-Path $root "build"
-$zip = Join-Path $dist "NightPedestrianDetection-Windows-x64.zip"
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Python environment not found: $python"
 }
+
+$version = (& $python -c "from app_utils.version import APP_VERSION; print(APP_VERSION)").Trim()
+$runtime = (& $python -c "import torch; print('CUDA' + str(torch.version.cuda).replace('.', '') if torch.version.cuda else 'CPU')").Trim()
+$zip = Join-Path $dist "NightPedestrianDetection-v$version-Windows-x64-$runtime.zip"
 
 & $python -m PyInstaller --noconfirm --clean (Join-Path $root "NightPedestrianDetection.spec")
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed with exit code $LASTEXITCODE"
 }
 
-$runtimeModel = Join-Path $dist "NightPedestrianDetection\_internal\models\rgbt_best.pt"
-if (-not (Test-Path -LiteralPath $runtimeModel)) {
-    throw "Bundled RGBT model not found: $runtimeModel"
+$runtimeRoot = Join-Path $dist "NightPedestrianDetection"
+$requiredFiles = @(
+    "NightPedestrianDetection.exe",
+    "_internal\yolo11n.pt",
+    "_internal\models\rgbt_best.pt",
+    "_internal\configs\bytetrack_realtime.yaml"
+)
+foreach ($relativePath in $requiredFiles) {
+    $requiredPath = Join-Path $runtimeRoot $relativePath
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+        throw "Required runtime file not found: $requiredPath"
+    }
 }
 
+$instructions = @(Get-ChildItem -LiteralPath (Join-Path $root "packaging") -Filter "*.txt")
+if ($instructions.Count -ne 1) {
+    throw "Expected exactly one packaging instructions file, found $($instructions.Count)"
+}
 Copy-Item `
-    -LiteralPath (Join-Path $root "packaging\使用说明.txt") `
-    -Destination (Join-Path $dist "NightPedestrianDetection\使用说明.txt") `
+    -LiteralPath $instructions[0].FullName `
+    -Destination (Join-Path $runtimeRoot $instructions[0].Name) `
     -Force
 
 if (Test-Path -LiteralPath $zip) {

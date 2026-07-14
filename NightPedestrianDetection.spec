@@ -4,6 +4,7 @@ from pathlib import Path
 root = Path(SPECPATH)
 datas = [
     (str(root / "yolo11n.pt"), "."),
+    (str(root / "configs" / "bytetrack_realtime.yaml"), "configs"),
     (
         str(root / "models" / "rgbt_best.pt"),
         "models",
@@ -15,7 +16,14 @@ a = Analysis(
     pathex=[str(root)],
     binaries=[],
     datas=datas,
-    hiddenimports=["cv2_enumerate_cameras"],
+    hiddenimports=[
+        "cv2_enumerate_cameras",
+        "scipy.optimize",
+        "ultralytics.trackers",
+        "ultralytics.trackers.byte_tracker",
+        "ultralytics.trackers.track",
+        "ultralytics.trackers.utils.matching",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

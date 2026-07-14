@@ -1,22 +1,51 @@
 from __future__ import annotations
 
 import os
+import platform
 import queue
+import subprocess
 import sys
 import time
 import threading
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+
+
+def _restart_with_safe_mkl_environment() -> None:
+    """Restart direct source runs before third-party DLLs initialize in IDE launchers."""
+    if __name__ != "__main__" or getattr(sys, "frozen", False):
+        return
+    if os.environ.get("MKL_THREADING_LAYER", "").upper() == "SEQUENTIAL":
+        return
+
+    environment = os.environ.copy()
+    environment["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+    print("[BOOT] 正在使用兼容的MKL线程环境重新启动程序", flush=True)
+    return_code = subprocess.call(
+        [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+        cwd=PROJECT_ROOT,
+        env=environment,
+    )
+    raise SystemExit(return_code)
+
+
+_restart_with_safe_mkl_environment()
+
+if PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+
+# Conda MKL and PyTorch may otherwise initialize different Intel OpenMP DLLs.
+os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
 
 import cv2
 import torch
 from PIL import Image, ImageTk
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
 OUTPUT_ROOT = (
@@ -37,6 +66,9 @@ from app_utils.acceleration import (
 from app_utils.camera import CameraDevice, choose_auto_camera_setup, discover_cameras
 from app_utils.data_loader import DatasetManager
 from app_utils.fusion import FusionEngine
+from app_utils.preprocess import to_uint8
+from app_utils.session import DetectionRecorder, EventClipRecorder, SettingsStore, normalize_settings
+from app_utils.version import APP_VERSION
 
 try:
     from ultralytics import YOLO
@@ -45,9 +77,15 @@ except ImportError:
 
 
 class MainApp:
+    PERFORMANCE_LABELS = {
+        "精度": "quality",
+        "均衡": "balanced",
+        "流畅": "smooth",
+    }
+
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("夜间行人检测系统 (RGB 3ch / RGBT 6ch + YOLO11)")
+        self.root.title(f"夜间行人检测系统 v{APP_VERSION} (RGB 3ch / RGBT 6ch + YOLO11)")
         self.root.geometry("1500x900")
         self.root.minsize(1200, 700)
 
@@ -60,25 +98,63 @@ class MainApp:
         self.current_model = None
         self.curr_img_idx = 0
 
-        self.path_var = tk.StringVar(value="")
+        self.settings_store = SettingsStore(OUTPUT_ROOT / "runs" / "gui_config" / "settings.json")
+        self.settings = self.settings_store.load()
+        performance_label = next(
+            (
+                label
+                for label, value in self.PERFORMANCE_LABELS.items()
+                if value == self.settings.get("performance_mode")
+            ),
+            "均衡",
+        )
+
+        self.path_var = tk.StringVar(value=self.settings.get("dataset_path", ""))
         self.split_var = tk.StringVar(value="test")
         self.model_var = tk.StringVar(value="")
         self.device_var = tk.StringVar(value="auto")
-        self.imgsz_var = tk.IntVar(value=384)
-        self.conf_var = tk.DoubleVar(value=0.25)
-        self.iou_var = tk.DoubleVar(value=0.45)
+        self.imgsz_var = tk.IntVar(value=int(self.settings.get("imgsz", 384)))
+        self.conf_var = tk.DoubleVar(value=float(self.settings.get("conf", 0.25)))
+        self.iou_var = tk.DoubleVar(value=float(self.settings.get("iou", 0.45)))
         self.speed_var = tk.DoubleVar(value=1.0)
+        self.performance_var = tk.StringVar(value=performance_label)
+        self.tracking_var = tk.BooleanVar(value=bool(self.settings.get("tracking_enabled", True)))
+        self.alert_var = tk.BooleanVar(value=bool(self.settings.get("alert_enabled", True)))
+        self.count_var = tk.StringVar(value="当前:0  累计:0  进入警戒区:0")
         self.info_var = tk.StringVar(value="请先选择 LLVIP 路径并加载模型")
 
         self._lock = threading.Lock()
         self._worker = None
+        self._image_pending = False
         self._img_refs = {}
+        self._display_geometry = {}
         self._ui_tasks = queue.SimpleQueue()
         self._video_ui_lock = threading.Lock()
         self._video_ui_payload = None
         self._closing = False
         self._fps_ema = 0.0
+        self._fps_times = deque(maxlen=30)
         self.video_predict_settings = None
+        self.video_model_name = ""
+        self.video_performance_mode = "balanced"
+        self.video_tracking_enabled = True
+        self.video_alert_enabled = True
+        self.video_ir_frame_offset = 0
+        self.video_ir_shift = (0, 0)
+        self._video_frame_index = 0
+        self._has_inference_result = False
+        self._last_detections = []
+        self._seen_track_ids = set()
+        self._inside_track_ids = set()
+        self._anonymous_inside_count = 0
+        self._anonymous_scene_count = 0
+        self._anonymous_seen_count = 0
+        self._alert_entry_count = 0
+        self._alert_flash_until = 0.0
+        roi = self.settings.get("alert_roi")
+        self.alert_roi = tuple(map(float, roi)) if isinstance(roi, list) and len(roi) == 4 else None
+        self._roi_selecting = False
+        self._roi_drag_start = None
 
         self.video_worker = None
         self.video_running = False
@@ -89,13 +165,24 @@ class MainApp:
         self.ir_video_backend = None
         self.stream_mode = "video"
         self.camera_scan_worker = None
+        self._camera_scan_generation = 0
         self.cap_vis = None
         self.cap_ir = None
         self.output_writer = None
+        self.output_writer_path = None
         self.output_path = None
         self.latest_result_frame = None
+        self.latest_result_base_frame = None
         self.save_dir = OUTPUT_ROOT / "runs" / "gui_results"
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.detection_recorder = DetectionRecorder()
+        self.event_recorder = EventClipRecorder(
+            self.save_dir / "events",
+            pre_seconds=float(self.settings.get("pre_event_seconds", 3.0)),
+            post_seconds=float(self.settings.get("post_event_seconds", 5.0)),
+            cooldown_seconds=float(self.settings.get("alarm_cooldown_seconds", 5.0)),
+            logger=self.log,
+        )
 
         self._build_ui()
         self.root.after(15, self._drain_ui_tasks)
@@ -147,8 +234,12 @@ class MainApp:
         selected = resolve_compute_device(self.device_var.get(), self.cpu_threads)
         device_changed = previous.predict_arg != selected.predict_arg
         restart_video = device_changed and self.video_running
-        if restart_video:
-            self.stop_video()
+        if device_changed and not self._wait_for_image_worker():
+            self.device_var.set(previous.predict_arg if previous.is_cuda else "cpu")
+            return
+        if device_changed and self.video_worker and self.video_worker.is_alive() and not self.stop_video():
+            self.device_var.set(previous.predict_arg if previous.is_cuda else "cpu")
+            return
 
         self.active_device = selected
         if device_changed:
@@ -163,34 +254,307 @@ class MainApp:
             self.log("[ACCEL] 推理设备已改变，正在重新开始视频")
             self.start_video_inference()
 
+    def _wait_for_image_worker(self, timeout: float | None = 10.0) -> bool:
+        worker = self._worker
+        if worker is None or not worker.is_alive() or worker is threading.current_thread():
+            return True
+        worker.join(timeout=timeout)
+        if worker.is_alive():
+            self.log("[GUI] 图片推理尚未结束，请稍后重试")
+            return False
+        return True
+
     def _read_predict_settings(self) -> dict:
+        try:
+            imgsz = int(self.imgsz_var.get())
+            conf = float(self.conf_var.get())
+            iou = float(self.iou_var.get())
+        except (tk.TclError, TypeError, ValueError) as error:
+            raise ValueError("imgsz、conf 和 iou 必须填写有效数字") from error
+        if not 32 <= imgsz <= 2048:
+            raise ValueError("imgsz 必须在 32 到 2048 之间")
+        if not 0.01 <= conf <= 1.0:
+            raise ValueError("conf 必须在 0.01 到 1.0 之间")
+        if not 0.01 <= iou <= 1.0:
+            raise ValueError("iou 必须在 0.01 到 1.0 之间")
+        return {"imgsz": imgsz, "conf": conf, "iou": iou}
+
+    def _read_video_speed(self) -> float:
+        try:
+            speed = float(self.speed_var.get())
+        except (tk.TclError, TypeError, ValueError) as error:
+            raise ValueError("播放倍速必须填写有效数字") from error
+        if not 0.25 <= speed <= 4.0:
+            raise ValueError("播放倍速必须在 0.25 到 4.0 之间")
+        return speed
+
+    def _performance_key(self) -> str:
+        return self.PERFORMANCE_LABELS.get(self.performance_var.get(), "balanced")
+
+    def _collect_settings(self) -> dict:
+        try:
+            predict_settings = self._read_predict_settings()
+        except ValueError:
+            predict_settings = {
+                "imgsz": int(self.settings.get("imgsz", 384)),
+                "conf": float(self.settings.get("conf", 0.25)),
+                "iou": float(self.settings.get("iou", 0.45)),
+            }
+        alert_roi = self.alert_roi
         return {
-            "imgsz": max(32, int(self.imgsz_var.get())),
-            "conf": max(0.01, float(self.conf_var.get())),
-            "iou": max(0.01, float(self.iou_var.get())),
+            "dataset_path": self.path_var.get().strip(),
+            **predict_settings,
+            "performance_mode": self._performance_key(),
+            "tracking_enabled": bool(self.tracking_var.get()),
+            "alert_enabled": bool(self.alert_var.get()),
+            "ir_frame_offset": int(self.settings.get("ir_frame_offset", 0)),
+            "ir_shift_x": int(self.settings.get("ir_shift_x", 0)),
+            "ir_shift_y": int(self.settings.get("ir_shift_y", 0)),
+            "pre_event_seconds": float(self.settings.get("pre_event_seconds", 3.0)),
+            "post_event_seconds": float(self.settings.get("post_event_seconds", 5.0)),
+            "alarm_cooldown_seconds": float(self.settings.get("alarm_cooldown_seconds", 5.0)),
+            "alert_roi": list(alert_roi) if alert_roi is not None else None,
         }
+
+    def _save_settings(self):
+        self.settings = normalize_settings(self._collect_settings())
+        try:
+            self.settings_store.save(self.settings)
+        except OSError as error:
+            self.log(f"[CONFIG] 保存设置失败: {error}")
+
+    def _reset_tracking_state(self):
+        self._video_frame_index = 0
+        self._has_inference_result = False
+        self._last_detections = []
+        self._seen_track_ids.clear()
+        self._inside_track_ids.clear()
+        self._anonymous_inside_count = 0
+        self._anonymous_scene_count = 0
+        self._anonymous_seen_count = 0
+        self._alert_entry_count = 0
+        self._post_ui(self.count_var.set, "当前:0  累计:0  进入警戒区:0")
+        predictor = getattr(self.current_model, "predictor", None)
+        for tracker in getattr(predictor, "trackers", []) or []:
+            try:
+                tracker.reset()
+            except Exception:
+                pass
+
+    def toggle_roi_selection(self):
+        self._roi_selecting = not self._roi_selecting
+        self._roi_drag_start = None
+        cursor = "crosshair" if self._roi_selecting else ""
+        self.lbl_result.inner_label.config(cursor=cursor)
+        self.info_var.set("请在检测结果画面中拖动鼠标设置警戒区" if self._roi_selecting else "已取消警戒区设置")
+
+    def clear_alert_roi(self):
+        self.alert_roi = None
+        self._inside_track_ids = set()
+        self._save_settings()
+        self._refresh_result_overlay()
+        self.log("[ALERT] 已清除警戒区域")
+
+    def _refresh_result_overlay(self):
+        if self.latest_result_base_frame is None:
+            return
+        preview = self.latest_result_base_frame.copy()
+        self._draw_alert_roi(preview)
+        self.latest_result_frame = preview.copy()
+        self._show_image(preview, self.lbl_result.inner_label)
+
+    def _event_to_normalized(self, event, *, clamp: bool = False) -> tuple[float, float] | None:
+        geometry = self._display_geometry.get(self.lbl_result.inner_label)
+        if geometry is None:
+            return None
+        _orig_w, _orig_h, render_w, render_h, offset_x, offset_y = geometry
+        if render_w <= 0 or render_h <= 0:
+            return None
+        raw_x = (event.x - offset_x) / render_w
+        raw_y = (event.y - offset_y) / render_h
+        if not clamp and not (0.0 <= raw_x <= 1.0 and 0.0 <= raw_y <= 1.0):
+            return None
+        nx = min(1.0, max(0.0, raw_x))
+        ny = min(1.0, max(0.0, raw_y))
+        return nx, ny
+
+    def _on_roi_press(self, event):
+        if not self._roi_selecting:
+            return
+        self._roi_drag_start = self._event_to_normalized(event)
+
+    def _on_roi_drag(self, event):
+        if not self._roi_selecting or self._roi_drag_start is None:
+            return
+        point = self._event_to_normalized(event, clamp=True)
+        if point is None:
+            return
+        x1, y1 = self._roi_drag_start
+        x2, y2 = point
+        self.alert_roi = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        self._refresh_result_overlay()
+
+    def _on_roi_release(self, event):
+        if not self._roi_selecting or self._roi_drag_start is None:
+            return
+        self._on_roi_drag(event)
+        self._roi_drag_start = None
+        self._roi_selecting = False
+        self.lbl_result.inner_label.config(cursor="")
+        if self.alert_roi is None or (
+            self.alert_roi[2] - self.alert_roi[0] < 0.02
+            or self.alert_roi[3] - self.alert_roi[1] < 0.02
+        ):
+            self.alert_roi = None
+            self.info_var.set("警戒区域过小，请重新设置")
+            return
+        self._save_settings()
+        self.log(f"[ALERT] 警戒区域已设置: {tuple(round(v, 3) for v in self.alert_roi)}")
+
+    def open_sync_settings(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("双模态同步与报警设置")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        values = {
+            "ir_frame_offset": tk.IntVar(value=int(self.settings.get("ir_frame_offset", 0))),
+            "ir_shift_x": tk.IntVar(value=int(self.settings.get("ir_shift_x", 0))),
+            "ir_shift_y": tk.IntVar(value=int(self.settings.get("ir_shift_y", 0))),
+            "pre_event_seconds": tk.DoubleVar(value=float(self.settings.get("pre_event_seconds", 3.0))),
+            "post_event_seconds": tk.DoubleVar(value=float(self.settings.get("post_event_seconds", 5.0))),
+            "alarm_cooldown_seconds": tk.DoubleVar(
+                value=float(self.settings.get("alarm_cooldown_seconds", 5.0))
+            ),
+        }
+        fields = [
+            ("IR帧偏移", "ir_frame_offset", -60, 60, 1),
+            ("IR水平偏移(px)", "ir_shift_x", -100, 100, 1),
+            ("IR垂直偏移(px)", "ir_shift_y", -100, 100, 1),
+            ("报警前录像(s)", "pre_event_seconds", 0, 10, 0.5),
+            ("报警后录像(s)", "post_event_seconds", 1, 30, 0.5),
+            ("报警冷却(s)", "alarm_cooldown_seconds", 1, 60, 1),
+        ]
+        for row, (label, key, minimum, maximum, increment) in enumerate(fields):
+            tk.Label(dialog, text=label, anchor="e", width=18).grid(row=row, column=0, padx=8, pady=5)
+            tk.Spinbox(
+                dialog,
+                from_=minimum,
+                to=maximum,
+                increment=increment,
+                textvariable=values[key],
+                width=10,
+            ).grid(row=row, column=1, padx=8, pady=5)
+
+        def apply_settings():
+            try:
+                parsed = {key: variable.get() for key, variable in values.items()}
+            except (tk.TclError, ValueError) as error:
+                messagebox.showerror("设置错误", f"请填写有效的同步与报警参数：\n{error}", parent=dialog)
+                return
+            restart_video = self.video_running
+            if self.video_worker and self.video_worker.is_alive() and not self.stop_video():
+                messagebox.showwarning("请稍候", "当前推理仍在结束，请稍后再次保存。", parent=dialog)
+                return
+            self.settings.update(parsed)
+            self._save_settings()
+            self.event_recorder.configure(
+                self.settings["pre_event_seconds"],
+                self.settings["post_event_seconds"],
+                self.settings["alarm_cooldown_seconds"],
+            )
+            self.log(
+                "[SYNC] 设置已保存: "
+                f"IR帧偏移={self.settings['ir_frame_offset']} "
+                f"平移=({self.settings['ir_shift_x']},{self.settings['ir_shift_y']})"
+            )
+            dialog.destroy()
+            if restart_video:
+                self.start_video_inference()
+
+        tk.Button(dialog, text="保存", command=apply_settings, width=10).grid(
+            row=len(fields), column=0, columnspan=2, pady=10
+        )
+        dialog.grab_set()
+
+    def export_detection_records(self):
+        if len(self.detection_recorder) == 0:
+            messagebox.showwarning("提示", "当前没有可导出的检测记录")
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="导出检测记录",
+            initialdir=str(self.save_dir),
+            initialfile=f"detections_{timestamp}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("JSON", "*.json")],
+        )
+        if not path:
+            return
+        output = self.detection_recorder.export(path)
+        self.log(f"[RECORD] 已导出 {len(self.detection_recorder)} 条记录: {output}")
+
+    def show_device_diagnostics(self):
+        cuda_available = torch.cuda.is_available()
+        lines = [
+            f"软件版本: v{APP_VERSION}",
+            f"系统: {platform.platform()}",
+            f"Python: {platform.python_version()}",
+            f"CPU: {platform.processor() or 'Unknown'}",
+            f"CPU逻辑核心: {os.cpu_count() or 1}",
+            f"PyTorch: {torch.__version__}",
+            f"OpenCV: {cv2.__version__}",
+            f"CUDA构建版本: {torch.version.cuda or 'None'}",
+            f"CUDA可用: {cuda_available}",
+            f"当前设备: {self.active_device.label}",
+            f"当前模型: {self.model_var.get() or '未加载'}",
+            f"模型通道: {self._current_model_channels() if self.current_model else '-'}",
+            f"性能模式: {self.performance_var.get()}",
+            f"检测记录: {len(self.detection_recorder)} 条",
+        ]
+        if cuda_available:
+            for index in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(index) / (1024**2)
+                total = torch.cuda.get_device_properties(index).total_memory / (1024**2)
+                lines.append(
+                    f"GPU {index}: {torch.cuda.get_device_name(index)} | 显存 {allocated:.0f}/{total:.0f} MB"
+                )
+        dialog = tk.Toplevel(self.root)
+        dialog.title("运行环境诊断")
+        dialog.geometry("680x420")
+        text_widget = tk.Text(dialog, font=("Consolas", 11), padx=12, pady=12)
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        text_widget.insert("1.0", "\n".join(lines))
+        text_widget.config(state="disabled")
+
+    def _on_runtime_option_change(self, event=None):
+        restart_video = self.video_running
+        if self.video_worker and self.video_worker.is_alive() and not self.stop_video():
+            return
+        self._save_settings()
+        if restart_video:
+            self.log("[GUI] 运行选项已改变，正在重新开始视频")
+            self.start_video_inference()
+
+    def _apply_predict_settings(self, event=None):
+        try:
+            self._read_predict_settings()
+        except ValueError as error:
+            messagebox.showerror("参数错误", str(error))
+            return
+        self._on_runtime_option_change()
+
+    def _apply_video_speed(self, event=None):
+        try:
+            self._read_video_speed()
+        except ValueError as error:
+            messagebox.showerror("参数错误", str(error))
+            return
+        self._on_runtime_option_change()
 
     def _build_ui(self):
         top = tk.Frame(self.root, bg="#eaeaea", pady=6)
         top.pack(side=tk.TOP, fill=tk.X)
-
-        tk.Label(top, text="LLVIP路径:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
-        self.path_entry = tk.Entry(top, textvariable=self.path_var, width=42)
-        self.path_entry.pack(side=tk.LEFT, padx=4)
-
-        tk.Button(top, text="浏览", command=self.browse_dataset).pack(side=tk.LEFT, padx=4)
-        tk.Button(top, text="加载/刷新", command=self.load_dataset_from_entry).pack(side=tk.LEFT, padx=6)
-
-        tk.Label(top, text="子集:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
-        self.split_combo = ttk.Combobox(
-            top,
-            textvariable=self.split_var,
-            values=["train", "test", "val"],
-            width=8,
-            state="readonly",
-        )
-        self.split_combo.pack(side=tk.LEFT, padx=4)
-        self.split_combo.bind("<<ComboboxSelected>>", self.on_split_change)
 
         tk.Label(top, text="模型:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
         self.model_combo = ttk.Combobox(
@@ -204,7 +568,7 @@ class MainApp:
         self.model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
         tk.Button(top, text="+ 加载模型(.pt)", command=self.load_custom_model).pack(side=tk.LEFT, padx=4)
 
-        tk.Label(top, text="device:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
+        tk.Label(top, text="设备:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
         self.device_combo = ttk.Combobox(
             top,
             textvariable=self.device_var,
@@ -217,7 +581,98 @@ class MainApp:
 
         for text, var in (("imgsz", self.imgsz_var), ("conf", self.conf_var), ("iou", self.iou_var)):
             tk.Label(top, text=f"{text}:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
-            tk.Entry(top, textvariable=var, width=6).pack(side=tk.LEFT, padx=4)
+            entry = tk.Entry(top, textvariable=var, width=6)
+            entry.pack(side=tk.LEFT, padx=4)
+            entry.bind("<Return>", self._apply_predict_settings)
+
+        tk.Label(top, text="性能:", bg="#eaeaea").pack(side=tk.LEFT, padx=(10, 4))
+        self.performance_combo = ttk.Combobox(
+            top,
+            textvariable=self.performance_var,
+            values=list(self.PERFORMANCE_LABELS),
+            width=6,
+            state="readonly",
+        )
+        self.performance_combo.pack(side=tk.LEFT, padx=4)
+        self.performance_combo.bind("<<ComboboxSelected>>", self._on_runtime_option_change)
+        ttk.Checkbutton(
+            top,
+            text="跟踪",
+            variable=self.tracking_var,
+            command=self._on_runtime_option_change,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            top,
+            text="警戒",
+            variable=self.alert_var,
+            command=self._on_runtime_option_change,
+        ).pack(side=tk.LEFT, padx=5)
+
+        controls = ttk.Notebook(self.root)
+        controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(4, 0))
+        realtime_tab = tk.Frame(controls, bg="#f4f4f4", pady=6)
+        evaluation_tab = tk.Frame(controls, bg="#f4f4f4", pady=6)
+        controls.add(realtime_tab, text="实时检测")
+        controls.add(evaluation_tab, text="数据集评估")
+
+        realtime_items = [
+            ("可见光视频", self.open_visible_video, 11),
+            ("红外视频", self.open_ir_video, 9),
+            ("自动摄像头", self.open_auto_camera, 11),
+            ("手动RGB+IR", self.open_rgbt_cameras, 11),
+            ("暂停/继续", self.toggle_pause_video, 9),
+            ("停止", self.stop_video, 7),
+            ("保存结果", self.save_current_result, 9),
+            ("设置警戒区", self.toggle_roi_selection, 10),
+            ("清除警戒区", self.clear_alert_roi, 10),
+            ("同步校准", self.open_sync_settings, 9),
+            ("导出记录", self.export_detection_records, 9),
+            ("设备信息", self.show_device_diagnostics, 9),
+        ]
+        for index, (text, command, width) in enumerate(realtime_items):
+            tk.Button(realtime_tab, text=text, command=command, width=width).grid(
+                row=index // 6,
+                column=index % 6,
+                padx=3,
+                pady=2,
+                sticky="w",
+            )
+        tk.Label(realtime_tab, text="倍速", bg="#f4f4f4").grid(row=0, column=6, padx=(10, 2))
+        speed_spinbox = tk.Spinbox(
+            realtime_tab,
+            from_=0.25,
+            to=4.0,
+            increment=0.25,
+            textvariable=self.speed_var,
+            width=5,
+            command=self._apply_video_speed,
+        )
+        speed_spinbox.grid(row=0, column=7, padx=2)
+        speed_spinbox.bind("<Return>", self._apply_video_speed)
+        tk.Label(
+            realtime_tab,
+            textvariable=self.count_var,
+            bg="#f4f4f4",
+            font=("Consolas", 10, "bold"),
+        ).grid(row=1, column=6, columnspan=3, padx=10, sticky="w")
+
+        tk.Label(evaluation_tab, text="LLVIP路径:", bg="#f4f4f4").pack(side=tk.LEFT, padx=6)
+        self.path_entry = tk.Entry(evaluation_tab, textvariable=self.path_var, width=52)
+        self.path_entry.pack(side=tk.LEFT, padx=4)
+        tk.Button(evaluation_tab, text="浏览", command=self.browse_dataset).pack(side=tk.LEFT, padx=3)
+        tk.Button(evaluation_tab, text="加载/刷新", command=self.load_dataset_from_entry).pack(side=tk.LEFT, padx=3)
+        tk.Label(evaluation_tab, text="子集:", bg="#f4f4f4").pack(side=tk.LEFT, padx=(8, 3))
+        self.split_combo = ttk.Combobox(
+            evaluation_tab,
+            textvariable=self.split_var,
+            values=["train", "test", "val"],
+            width=7,
+            state="readonly",
+        )
+        self.split_combo.pack(side=tk.LEFT, padx=3)
+        self.split_combo.bind("<<ComboboxSelected>>", self.on_split_change)
+        tk.Button(evaluation_tab, text="< 上一张", command=self.prev_img, width=9).pack(side=tk.LEFT, padx=3)
+        tk.Button(evaluation_tab, text="下一张 >", command=self.next_img, width=9).pack(side=tk.LEFT, padx=3)
 
         mid = tk.Frame(self.root, bg="#fff")
         mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -234,39 +689,18 @@ class MainApp:
         self.lbl_fusion.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
         self.lbl_ir.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
         self.lbl_result.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
+        self.lbl_result.inner_label.bind("<ButtonPress-1>", self._on_roi_press)
+        self.lbl_result.inner_label.bind("<B1-Motion>", self._on_roi_drag)
+        self.lbl_result.inner_label.bind("<ButtonRelease-1>", self._on_roi_release)
 
-        btm = tk.Frame(self.root, bg="#f0f0f0", pady=6)
+        btm = tk.Frame(self.root, bg="#f0f0f0", pady=5)
         btm.pack(side=tk.BOTTOM, fill=tk.X)
-        items = [
-            ("< 上一张", self.prev_img, 10),
-            ("下一张 >", self.next_img, 10),
-            ("可见光视频", self.open_visible_video, 12),
-            ("红外视频", self.open_ir_video, 10),
-            ("自动摄像头", self.open_auto_camera, 11),
-            ("手动RGB+IR", self.open_rgbt_cameras, 12),
-            ("暂停/继续", self.toggle_pause_video, 10),
-            ("停止视频", self.stop_video, 10),
-            ("保存结果", self.save_current_result, 10),
-        ]
-        for text, cmd, width in items:
-            tk.Button(btm, text=text, command=cmd, width=width).pack(side=tk.LEFT, padx=5)
-
-        tk.Label(btm, text="倍速", bg="#f0f0f0").pack(side=tk.LEFT, padx=(10, 4))
-        tk.Spinbox(
-            btm,
-            from_=0.25,
-            to=4.0,
-            increment=0.25,
-            textvariable=self.speed_var,
-            width=6,
-        ).pack(side=tk.LEFT, padx=4)
-
         tk.Label(
             btm,
             textvariable=self.info_var,
             bg="#f0f0f0",
             font=("Consolas", 10),
-        ).pack(side=tk.LEFT, padx=12)
+        ).pack(side=tk.LEFT, padx=10)
 
         logf = tk.Frame(self.root, bg="#f8f8f8")
         logf.pack(side=tk.BOTTOM, fill=tk.X)
@@ -298,6 +732,8 @@ class MainApp:
             self.path_var.set(p)
 
     def load_dataset_from_entry(self):
+        if not self._wait_for_image_worker():
+            return
         try:
             self.data_manager = DatasetManager(self.path_var.get().strip(), logger=self.log)
             self.on_split_change(None)
@@ -308,6 +744,8 @@ class MainApp:
 
     def on_split_change(self, event):
         if self.data_manager is None:
+            return
+        if not self._wait_for_image_worker():
             return
         split = self.split_combo.get().strip() or self.split_var.get().strip()
         n = self.data_manager.load_split(split)
@@ -474,10 +912,12 @@ class MainApp:
         )
         if not p:
             return
+        if not self._wait_for_image_worker():
+            return
         try:
             restart_video = self.video_running
-            if restart_video:
-                self.stop_video()
+            if self.video_worker and self.video_worker.is_alive() and not self.stop_video():
+                return
             self._register_model(p)
             if restart_video:
                 self.start_video_inference()
@@ -489,9 +929,21 @@ class MainApp:
 
     def on_model_change(self, event):
         if self.model_var.get() in self.models:
+            if not self._wait_for_image_worker():
+                current_name = next(
+                    (name for name, model in self.models.items() if model is self.current_model),
+                    "",
+                )
+                self.model_var.set(current_name)
+                return
             restart_video = self.video_running
-            if restart_video:
-                self.stop_video()
+            if self.video_worker and self.video_worker.is_alive() and not self.stop_video():
+                current_name = next(
+                    (name for name, model in self.models.items() if model is self.current_model),
+                    "",
+                )
+                self.model_var.set(current_name)
+                return
             self.current_model = self.models[self.model_var.get()]
             if restart_video:
                 self.start_video_inference()
@@ -509,21 +961,44 @@ class MainApp:
             self.process_current_image_async()
 
     def process_current_image_async(self):
-        if self._worker and self._worker.is_alive():
+        if self._closing:
             return
-        predict_settings = self._read_predict_settings()
+        if self.video_running or (self.video_worker and self.video_worker.is_alive()):
+            self._image_pending = False
+            self.log("[GUI] 实时视频运行时不执行数据集图片推理")
+            return
+        if self._worker and self._worker.is_alive():
+            self._image_pending = True
+            return
+        try:
+            predict_settings = self._read_predict_settings()
+        except ValueError as error:
+            messagebox.showerror("参数错误", str(error))
+            return
+        self._image_pending = False
         self._worker = threading.Thread(
-            target=self.process_current_image,
+            target=self._image_worker_entry,
             args=(predict_settings,),
             daemon=True,
         )
         self._worker.start()
 
+    def _image_worker_entry(self, predict_settings):
+        try:
+            self.process_current_image(predict_settings)
+        except Exception as error:
+            self.log(f"[GUI] 图片推理失败: {error}")
+        finally:
+            self._worker = None
+            if self._image_pending:
+                self._post_ui(self.process_current_image_async)
+
     def process_current_image(self, predict_settings=None):
         with self._lock:
             if not self.data_manager or not self.data_manager.current_data:
                 return
-            item = self.data_manager.get_item(self.curr_img_idx)
+            index = self.curr_img_idx
+            item = self.data_manager.get_item(index)
             if not item:
                 return
             rgb, ir, gt_boxes, fname = item
@@ -532,7 +1007,7 @@ class MainApp:
                 ir,
                 gt_boxes,
                 fname,
-                len(self.data_manager.current_data),
+                (index + 1, len(self.data_manager.current_data)),
                 predict_settings,
             )
 
@@ -553,30 +1028,56 @@ class MainApp:
             c += 1
         return c
 
-    def _predict_once(self, input_tensor, settings: dict, device: ComputeDevice):
+    def _predict_once(
+        self,
+        input_tensor,
+        settings: dict,
+        device: ComputeDevice,
+        tracking: bool = False,
+    ):
         synchronize_if_cuda(device)
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            results = self.current_model.predict(
-                input_tensor,
-                device=device.predict_arg,
-                half=device.use_half,
-                imgsz=settings["imgsz"],
-                conf=settings["conf"],
-                iou=settings["iou"],
-                classes=[0],
-                verbose=False,
+        predict_kwargs = {
+            "device": device.predict_arg,
+            "half": device.use_half,
+            "imgsz": settings["imgsz"],
+            "conf": settings["conf"],
+            "iou": settings["iou"],
+            "classes": [0],
+            "verbose": False,
+        }
+        if tracking:
+            if not getattr(self.current_model, "_gui_tracker_registered", False):
+                from ultralytics.trackers import register_tracker
+
+                register_tracker(self.current_model, persist=True)
+                self.current_model._gui_tracker_registered = True
+            predict_kwargs.update(
+                {
+                    "mode": "track",
+                    "tracker": str(BUNDLE_ROOT / "configs" / "bytetrack_realtime.yaml"),
+                }
             )
+        with torch.inference_mode():
+            results = self.current_model.predict(input_tensor, **predict_kwargs)
         synchronize_if_cuda(device)
         return results, (time.perf_counter() - t0) * 1000.0
 
-    def _draw_pred(self, image, input_tensor, predict_settings=None):
+    def _draw_pred(
+        self,
+        image,
+        input_tensor,
+        predict_settings=None,
+        *,
+        tracking: bool = False,
+        draw: bool = True,
+    ):
         if self.current_model is None:
-            return 0.0, 0, []
+            return 0.0, 0, [], []
         settings = predict_settings or {"imgsz": 384, "conf": 0.25, "iou": 0.45}
         device = self.active_device
         try:
-            results, dt = self._predict_once(input_tensor, settings, device)
+            results, dt = self._predict_once(input_tensor, settings, device, tracking=tracking)
         except Exception as e:
             if not device.is_cuda or not is_cuda_runtime_error(e):
                 raise
@@ -585,47 +1086,184 @@ class MainApp:
             self.current_model.predictor = None
             self.active_device = resolve_compute_device("cpu", self.cpu_threads)
             self._post_ui(self.device_var.set, "cpu")
-            results, dt = self._predict_once(input_tensor, settings, self.active_device)
+            results, dt = self._predict_once(
+                input_tensor,
+                settings,
+                self.active_device,
+                tracking=tracking,
+            )
 
-        c = 0
+        detections = []
         det_logs = []
         if results and results[0].boxes is not None:
             for b in results[0].boxes:
                 x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int).tolist()
                 score = float(b.conf[0])
-                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                label = f"{score:.2f}"
-                cv2.putText(
-                    image,
-                    label,
-                    (x1, max(24, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
+                track_id = None
+                if getattr(b, "id", None) is not None:
+                    track_id = int(b.id[0].item())
+                detections.append(
+                    {
+                        "box": (x1, y1, x2, y2),
+                        "confidence": score,
+                        "track_id": track_id,
+                    }
                 )
-                det_logs.append(f"#{c + 1} conf={score:.2f} box=({x1},{y1},{x2},{y2})")
-                c += 1
-        return dt, c, det_logs
+                id_text = f" id={track_id}" if track_id is not None else ""
+                det_logs.append(
+                    f"#{len(detections)}{id_text} conf={score:.2f} box=({x1},{y1},{x2},{y2})"
+                )
+        if draw:
+            self._draw_detections(image, detections)
+        return dt, len(detections), det_logs, detections
+
+    @staticmethod
+    def _draw_detections(image, detections: list[dict], inside_ids: set[int] | None = None):
+        inside_ids = inside_ids or set()
+        for detection in detections:
+            x1, y1, x2, y2 = detection["box"]
+            score = float(detection["confidence"])
+            track_id = detection.get("track_id")
+            inside = bool(detection.get("inside_alert_roi", False)) or (
+                track_id is not None and int(track_id) in inside_ids
+            )
+            color = (0, 0, 255) if not inside else (0, 165, 255)
+            thickness = 3 if inside else 2
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+            label = f"ID:{track_id} {score:.2f}" if track_id is not None else f"{score:.2f}"
+            cv2.putText(
+                image,
+                label,
+                (x1, max(24, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _evaluate_alert(self, detections: list[dict], frame_shape) -> tuple[set[int], bool, int]:
+        height, width = frame_shape[:2]
+        track_ids = {
+            int(detection["track_id"])
+            for detection in detections
+            if detection.get("track_id") is not None
+        }
+        self._seen_track_ids.update(track_ids)
+        inside_ids = set()
+        anonymous_inside_count = 0
+
+        for detection in detections:
+            detection["inside_alert_roi"] = False
+
+        alert_roi = self.alert_roi
+        if self.video_alert_enabled and alert_roi is not None:
+            rx1, ry1, rx2, ry2 = alert_roi
+            for detection in detections:
+                x1, y1, x2, y2 = detection["box"]
+                center_x = ((x1 + x2) / 2) / max(width, 1)
+                center_y = ((y1 + y2) / 2) / max(height, 1)
+                if rx1 <= center_x <= rx2 and ry1 <= center_y <= ry2:
+                    detection["inside_alert_roi"] = True
+                    track_id = detection.get("track_id")
+                    if track_id is None:
+                        anonymous_inside_count += 1
+                    else:
+                        inside_ids.add(int(track_id))
+
+        new_ids = inside_ids - self._inside_track_ids
+        anonymous_entries = max(0, anonymous_inside_count - self._anonymous_inside_count)
+        trigger = bool(new_ids) or anonymous_entries > 0
+        if trigger:
+            self._alert_entry_count += len(new_ids) + anonymous_entries
+            self._alert_flash_until = time.monotonic() + 1.2
+            entered_parts = [",".join(map(str, sorted(new_ids)))] if new_ids else []
+            if anonymous_entries:
+                entered_parts.append(f"未跟踪目标x{anonymous_entries}")
+            entered = " / ".join(entered_parts)
+            self.log(f"[ALERT] 行人进入警戒区域: {entered}")
+            self._play_alarm_sound()
+
+        self._inside_track_ids = inside_ids
+        self._anonymous_inside_count = anonymous_inside_count
+        current_count = len(detections)
+        if self.video_tracking_enabled:
+            anonymous_current = sum(detection.get("track_id") is None for detection in detections)
+            self._anonymous_seen_count = max(
+                self._anonymous_seen_count,
+                len(self._seen_track_ids) + anonymous_current,
+            )
+        else:
+            self._anonymous_seen_count += max(0, current_count - self._anonymous_scene_count)
+        self._anonymous_scene_count = current_count
+        unique_count = self._anonymous_seen_count
+        self._post_ui(
+            self.count_var.set,
+            f"当前:{len(detections)}  累计:{unique_count}  进入警戒区:{self._alert_entry_count}",
+        )
+        return inside_ids, trigger, unique_count
+
+    def _draw_alert_roi(self, image):
+        alert_roi = self.alert_roi
+        if alert_roi is None:
+            return
+        height, width = image.shape[:2]
+        x1 = int(alert_roi[0] * width)
+        y1 = int(alert_roi[1] * height)
+        x2 = int(alert_roi[2] * width)
+        y2 = int(alert_roi[3] * height)
+        active = time.monotonic() < self._alert_flash_until
+        color = (0, 0, 255) if active else (0, 255, 255)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 3 if active else 2)
+        cv2.putText(
+            image,
+            "ALERT ROI",
+            (x1, max(24, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _play_alarm_sound(self):
+        def play():
+            try:
+                if os.name == "nt":
+                    import winsound
+
+                    winsound.Beep(1250, 180)
+                    winsound.Beep(1550, 180)
+                else:
+                    self._post_ui(self.root.bell)
+            except Exception:
+                pass
+
+        threading.Thread(target=play, daemon=True).start()
 
     def _infer_and_update(self, rgb, ir, gt_boxes, fname, total, predict_settings=None):
-        ir_show = ir if ir.ndim == 3 else cv2.cvtColor(ir, cv2.COLOR_GRAY2BGR)
-        t0 = time.time()
+        ir_show = to_uint8(ir if ir.ndim == 3 else cv2.cvtColor(ir, cv2.COLOR_GRAY2BGR))
+        t0 = time.perf_counter()
         ir_preprocessed = self.fusion_engine.preprocess_ir(ir)
         fused = self.fusion_engine.for_display_with_preprocessed_ir(rgb, ir_preprocessed)
         model_input = self._model_input_with_preprocessed_ir(rgb, ir_preprocessed)
-        fuse_ms = (time.time() - t0) * 1000.0
+        fuse_ms = (time.perf_counter() - t0) * 1000.0
         res = fused.copy()
         gt_count = self._draw_gt(res, gt_boxes)
-        det_ms, pred_count, det_logs = (0.0, 0, [])
+        det_ms, pred_count, det_logs, _detections = (0.0, 0, [], [])
         try:
             if model_input is not None:
-                det_ms, pred_count, det_logs = self._draw_pred(res, model_input, predict_settings)
+                det_ms, pred_count, det_logs, _detections = self._draw_pred(
+                    res,
+                    model_input,
+                    predict_settings,
+                )
         except Exception as e:
             self.log(f"[GUI] 推理出错: {e}")
         if det_logs:
             self.log("[PRED] " + "; ".join(det_logs))
+        self.latest_result_base_frame = res.copy()
+        self._draw_alert_roi(res)
         self.latest_result_frame = res.copy()
         self._post_ui(
             self._update_ui_images,
@@ -685,25 +1323,44 @@ class MainApp:
         if cv_img is None:
             tk_label.config(text="No Image", image="")
             return
-        ww, wh = max(396, tk_label.winfo_width() - 4), max(296, tk_label.winfo_height() - 4)
+        cv_img = to_uint8(cv_img)
+        ww, wh = max(160, tk_label.winfo_width() - 4), max(120, tk_label.winfo_height() - 4)
         h, w = cv_img.shape[:2]
         s = min(ww / max(w, 1), wh / max(h, 1))
-        img = cv2.resize(cv_img, (max(1, int(w * s)), max(1, int(h * s))))
+        render_w, render_h = max(1, int(w * s)), max(1, int(h * s))
+        img = cv2.resize(cv_img, (render_w, render_h))
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(img))
         tk_label.config(image=photo, text="")
         self._img_refs[tk_label] = photo
+        label_w, label_h = max(1, tk_label.winfo_width()), max(1, tk_label.winfo_height())
+        self._display_geometry[tk_label] = (
+            w,
+            h,
+            render_w,
+            render_h,
+            max(0, (label_w - render_w) / 2),
+            max(0, (label_h - render_h) / 2),
+        )
 
     def _set_no_image_all(self):
+        self.latest_result_frame = None
+        self.latest_result_base_frame = None
         for frame in [self.lbl_rgb, self.lbl_ir, self.lbl_fusion, self.lbl_result]:
             frame.inner_label.config(text="No Image", image="")
             self._img_refs.pop(frame.inner_label, None)
+            self._display_geometry.pop(frame.inner_label, None)
 
     def open_visible_video(self):
-        p = filedialog.askopenfilename(title="选择可见光视频", filetypes=[("Video", "*.mp4;*.avi;*.mov;*.mkv")])
+        p = filedialog.askopenfilename(
+            title="选择可见光视频",
+            filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv")],
+        )
         if p:
+            self._camera_scan_generation += 1
             was_camera = self.stream_mode.startswith("camera_")
-            self.stop_video()
+            if not self.stop_video():
+                return
             self.stream_mode = "video"
             if was_camera:
                 self.ir_video_source = None
@@ -716,10 +1373,15 @@ class MainApp:
                 self.start_video_inference()
 
     def open_ir_video(self):
-        p = filedialog.askopenfilename(title="选择红外视频", filetypes=[("Video", "*.mp4;*.avi;*.mov;*.mkv")])
+        p = filedialog.askopenfilename(
+            title="选择红外视频",
+            filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv")],
+        )
         if p:
+            self._camera_scan_generation += 1
             was_camera = self.stream_mode.startswith("camera_")
-            self.stop_video()
+            if not self.stop_video():
+                return
             self.stream_mode = "video"
             if was_camera:
                 self.video_source = None
@@ -733,25 +1395,38 @@ class MainApp:
         if self.camera_scan_worker and self.camera_scan_worker.is_alive():
             self.log("[CAM] 正在扫描摄像头，请稍候")
             return
-        self.stop_video()
+        if not self._wait_for_image_worker() or not self.stop_video():
+            return
+        self._camera_scan_generation += 1
+        generation = self._camera_scan_generation
         self.info_var.set("正在扫描摄像头...")
         self.log("[CAM] 开始自动识别摄像头")
-        self.camera_scan_worker = threading.Thread(target=self._scan_cameras, daemon=True)
+        self.camera_scan_worker = threading.Thread(
+            target=self._scan_cameras,
+            args=(generation,),
+            daemon=True,
+        )
         self.camera_scan_worker.start()
 
-    def _scan_cameras(self):
+    def _scan_cameras(self, generation: int):
         try:
             devices = discover_cameras(validate=True)
-            self.root.after(0, self._start_auto_camera, devices)
+            self._post_ui(self._start_auto_camera, generation, devices)
         except Exception as e:
-            self.root.after(0, self._show_camera_scan_error, str(e))
+            self._post_ui(self._show_camera_scan_error, generation, str(e))
 
-    def _show_camera_scan_error(self, error: str):
+    def _show_camera_scan_error(self, generation: int, error: str):
+        if generation != self._camera_scan_generation:
+            return
         self.info_var.set("摄像头扫描失败")
         self.log(f"[CAM] 摄像头扫描失败: {error}")
         messagebox.showerror("摄像头错误", f"自动识别摄像头失败：\n{error}")
 
-    def _start_auto_camera(self, devices: list[CameraDevice]):
+    def _start_auto_camera(self, generation: int, devices: list[CameraDevice]):
+        if generation != self._camera_scan_generation or self._closing:
+            return
+        if not self._wait_for_image_worker():
+            return
         if not devices:
             self.info_var.set("未检测到可用摄像头")
             messagebox.showwarning(
@@ -788,7 +1463,12 @@ class MainApp:
             self.stream_mode = "camera_rgb"
             self.ir_video_source = None
             self.ir_video_backend = None
-            source_type = "内置前置" if setup.rgb.is_integrated else "外接"
+            if setup.rgb.is_integrated:
+                source_type = "内置前置"
+            elif setup.rgb.is_generic:
+                source_type = "默认RGB"
+            else:
+                source_type = "外接"
             self.log(
                 f"[CAM] 自动使用{source_type}摄像头: {setup.rgb.name}({setup.rgb.index}) | "
                 f"3通道模型:{self.model_var.get()}"
@@ -796,6 +1476,9 @@ class MainApp:
         self.start_video_inference()
 
     def open_rgbt_cameras(self):
+        if not self._wait_for_image_worker() or not self.stop_video():
+            return
+        self._camera_scan_generation += 1
         rgb_camera_id = simpledialog.askinteger(
             "RGB+IR双摄像头",
             "请输入可见光摄像头编号：",
@@ -837,17 +1520,25 @@ class MainApp:
     def toggle_pause_video(self):
         if self.video_running:
             self.video_paused = not self.video_paused
+            if self.video_paused:
+                self.event_recorder.flush()
+            else:
+                self._fps_times.clear()
+                self._fps_ema = 0.0
             self.log("[GUI] 视频已暂停" if self.video_paused else "[GUI] 视频继续播放")
 
-    def stop_video(self):
+    def stop_video(self, wait_timeout: float | None = 10.0) -> bool:
         self.video_running = False
         self.video_paused = False
         worker = self.video_worker
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-            worker.join(timeout=3.0)
-        if worker is None or not worker.is_alive():
-            self.video_worker = None
-            self._release_video_io()
+            worker.join(timeout=wait_timeout)
+        if worker is not None and worker.is_alive():
+            self.log("[GUI] 视频线程仍在结束，已取消本次重启操作")
+            return False
+        self.video_worker = None
+        self._release_video_io()
+        return True
 
     def _release_video_io(self):
         for cap in (self.cap_vis, self.cap_ir):
@@ -858,12 +1549,47 @@ class MainApp:
                     pass
         self.cap_vis = None
         self.cap_ir = None
+        self._close_output_writer(clear_request=True)
+
+    def _close_output_writer(self, clear_request: bool = False):
         if self.output_writer is not None:
             try:
                 self.output_writer.release()
             except Exception:
                 pass
         self.output_writer = None
+        self.output_writer_path = None
+        if clear_request:
+            self.output_path = None
+
+    def _write_output_frame(self, frame, source_fps: float, is_camera: bool) -> None:
+        requested_path = self.output_path
+        if not requested_path:
+            return
+        if self.output_writer is None or self.output_writer_path != requested_path:
+            self._close_output_writer(clear_request=False)
+            output = Path(requested_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            height, width = frame.shape[:2]
+            writer_fps = source_fps
+            if is_camera and self._fps_ema > 1.0:
+                writer_fps = min(source_fps, self._fps_ema)
+            writer = cv2.VideoWriter(
+                str(output),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                max(1.0, float(writer_fps)),
+                (width, height),
+            )
+            if not writer.isOpened():
+                writer.release()
+                if self.output_path == requested_path:
+                    self.output_path = None
+                self.log(f"[GUI] 无法创建视频结果文件: {output}")
+                return
+            self.output_writer = writer
+            self.output_writer_path = requested_path
+            self.log(f"[GUI] 已开始录制视频结果: {output}")
+        self.output_writer.write(frame)
 
     @staticmethod
     def _open_capture(source, backend=None):
@@ -881,6 +1607,8 @@ class MainApp:
     def start_video_inference(self):
         if self.current_model is None:
             messagebox.showwarning("提示", "请先加载模型")
+            return
+        if not self._wait_for_image_worker():
             return
 
         ch = self._current_model_channels()
@@ -910,17 +1638,43 @@ class MainApp:
             )
             return
 
-        self.stop_video()
+        try:
+            predict_settings = self._read_predict_settings()
+            video_speed = self._read_video_speed()
+        except ValueError as error:
+            messagebox.showerror("参数错误", str(error))
+            return
+        if not self.stop_video():
+            return
         self.video_model_channels = ch
-        self.video_predict_settings = self._read_predict_settings()
-        self.video_speed = max(0.25, float(self.speed_var.get()))
+        self.video_model_name = self.model_var.get()
+        self.video_predict_settings = predict_settings
+        self.video_speed = video_speed
+        self.video_performance_mode = self._performance_key()
+        self.video_tracking_enabled = bool(self.tracking_var.get())
+        self.video_alert_enabled = bool(self.alert_var.get())
+        self.video_ir_frame_offset = int(self.settings.get("ir_frame_offset", 0))
+        self.video_ir_shift = (
+            int(self.settings.get("ir_shift_x", 0)),
+            int(self.settings.get("ir_shift_y", 0)),
+        )
+        self.event_recorder.configure(
+            self.settings.get("pre_event_seconds", 3.0),
+            self.settings.get("post_event_seconds", 5.0),
+            self.settings.get("alarm_cooldown_seconds", 5.0),
+        )
+        self.event_recorder.reset()
+        self._reset_tracking_state()
+        self._save_settings()
         self.video_running = True
         with self._video_ui_lock:
             self._video_ui_payload = None
         self._fps_ema = 0.0
+        self._fps_times.clear()
         self.log(
             f"[ACCEL] 视频推理使用 {self.active_device.label} | "
-            f"imgsz={self.video_predict_settings['imgsz']}"
+            f"imgsz={self.video_predict_settings['imgsz']} | "
+            f"模式={self.performance_var.get()} | 跟踪={'开' if self.video_tracking_enabled else '关'}"
         )
         self.video_worker = threading.Thread(target=self._video_loop, daemon=True)
         self.video_worker.start()
@@ -948,74 +1702,147 @@ class MainApp:
             fps = self.cap_vis.get(cv2.CAP_PROP_FPS) or 25.0
             if fps <= 1.0 or fps > 240.0:
                 fps = 25.0
+            if use_ir and not is_camera and self.video_ir_frame_offset != 0:
+                target = self.cap_ir if self.video_ir_frame_offset > 0 else self.cap_vis
+                for _ in range(abs(self.video_ir_frame_offset)):
+                    if not target.grab():
+                        break
+                self.log(f"[SYNC] 已应用IR帧偏移: {self.video_ir_frame_offset}")
             if is_camera:
                 total_frames = "实时"
             elif use_ir:
-                total_frames = int(
-                    min(
-                        self.cap_vis.get(cv2.CAP_PROP_FRAME_COUNT) or 0,
-                        self.cap_ir.get(cv2.CAP_PROP_FRAME_COUNT) or 0,
-                    )
-                ) or 1
+                visible_frames = int(self.cap_vis.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                infrared_frames = int(self.cap_ir.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if self.video_ir_frame_offset > 0:
+                    infrared_frames = max(0, infrared_frames - self.video_ir_frame_offset)
+                elif self.video_ir_frame_offset < 0:
+                    visible_frames = max(0, visible_frames + self.video_ir_frame_offset)
+                total_frames = min(visible_frames, infrared_frames) or 1
             else:
                 total_frames = int(self.cap_vis.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or 1
             delay = max(0.001, 1.0 / (fps * self.video_speed))
             skip_accum = 0.0
+            inference_stride = 2 if self.video_performance_mode == "smooth" and use_ir else 1
 
             while self.video_running:
-                frame_t0 = time.time()
+                frame_t0 = time.perf_counter()
                 if self.video_paused:
                     time.sleep(0.05)
                     continue
 
-                rv, fv = self.cap_vis.read()
-                if not rv:
-                    break
-                if use_ir:
-                    ri, fi = self.cap_ir.read()
-                    if not ri:
+                if is_camera and use_ir:
+                    if not self.cap_vis.grab() or not self.cap_ir.grab():
+                        break
+                    rv, fv = self.cap_vis.retrieve()
+                    ri, fi = self.cap_ir.retrieve()
+                    if not rv or not ri:
                         break
                 else:
-                    fi = None
+                    rv, fv = self.cap_vis.read()
+                    if not rv:
+                        break
+                    if use_ir:
+                        ri, fi = self.cap_ir.read()
+                        if not ri:
+                            break
+                    else:
+                        fi = None
 
-                frame_no = int(self.cap_vis.get(cv2.CAP_PROP_POS_FRAMES))
-                fuse_t0 = time.time()
+                visible_frame_no = int(self.cap_vis.get(cv2.CAP_PROP_POS_FRAMES))
+                frame_no = max(1, visible_frame_no + min(0, self.video_ir_frame_offset))
+                self._video_frame_index += 1
+                should_infer = (
+                    self._video_frame_index % inference_stride == 1 % inference_stride
+                    or not self._has_inference_result
+                )
+                fuse_t0 = time.perf_counter()
                 if use_ir:
-                    ir_show = fi if fi.ndim == 3 else cv2.cvtColor(fi, cv2.COLOR_GRAY2BGR)
-                    ir_preprocessed = self.fusion_engine.preprocess_ir(fi, realtime=True)
-                    fused = self.fusion_engine.for_display_with_preprocessed_ir(fv, ir_preprocessed)
-                    model_input = self.fusion_engine.for_model_with_preprocessed_ir(fv, ir_preprocessed)
+                    fi = self.fusion_engine.shift_ir(fi, *self.video_ir_shift)
+                    ir_show = to_uint8(fi if fi.ndim == 3 else cv2.cvtColor(fi, cv2.COLOR_GRAY2BGR))
+                    if should_infer:
+                        ir_preprocessed = self.fusion_engine.preprocess_ir(
+                            fi,
+                            realtime=self.video_performance_mode != "quality",
+                        )
+                        fused = self.fusion_engine.for_display_with_preprocessed_ir(fv, ir_preprocessed)
+                        model_input = self.fusion_engine.for_model_with_preprocessed_ir(fv, ir_preprocessed)
+                    else:
+                        fused = self.fusion_engine.for_display_fast(fv, fi)
+                        model_input = None
                 else:
                     ir_show = None
                     fused = fv.copy()
                     model_input = fv
-                fuse_ms = (time.time() - fuse_t0) * 1000.0
+                fuse_ms = (time.perf_counter() - fuse_t0) * 1000.0
                 res = fused.copy()
-                det_ms, pred_count, _det_logs = self._draw_pred(
-                    res,
-                    model_input,
-                    self.video_predict_settings,
+                if should_infer:
+                    det_ms, pred_count, _det_logs, detections = self._draw_pred(
+                        res,
+                        model_input,
+                        self.video_predict_settings,
+                        tracking=self.video_tracking_enabled,
+                        draw=False,
+                    )
+                    self._last_detections = detections
+                    self._has_inference_result = True
+                else:
+                    det_ms = 0.0
+                    detections = list(self._last_detections)
+                    pred_count = len(detections)
+
+                inside_ids, alert_triggered, unique_count = self._evaluate_alert(
+                    detections,
+                    res.shape,
                 )
+                self._draw_detections(res, detections, inside_ids)
+                self.latest_result_base_frame = res.copy()
+                self._draw_alert_roi(res)
                 self.latest_result_frame = res.copy()
 
-                if self.output_path:
-                    if self.output_writer is None:
-                        h, w = res.shape[:2]
-                        self.output_writer = cv2.VideoWriter(
-                            self.output_path,
-                            cv2.VideoWriter_fourcc(*"mp4v"),
-                            fps,
-                            (w, h),
-                        )
-                    self.output_writer.write(res)
+                self._write_output_frame(res, fps, is_camera)
 
-                elapsed = time.time() - frame_t0
-                instant_fps = 1.0 / max(elapsed, 1e-6)
-                self._fps_ema = (
-                    instant_fps
-                    if self._fps_ema <= 0
-                    else 0.85 * self._fps_ema + 0.15 * instant_fps
-                )
+                elapsed = time.perf_counter() - frame_t0
+                self._fps_times.append(time.perf_counter())
+                if len(self._fps_times) > 1:
+                    self._fps_ema = (len(self._fps_times) - 1) / max(
+                        self._fps_times[-1] - self._fps_times[0],
+                        1e-6,
+                    )
+                else:
+                    self._fps_ema = 1.0 / max(elapsed, 1e-6)
+                source_name = "camera" if is_camera else Path(str(self.video_source)).name
+                if should_infer:
+                    self.detection_recorder.append_frame(
+                        source=source_name,
+                        frame="实时" if is_camera else frame_no,
+                        detections=detections,
+                        inside_ids=inside_ids,
+                        current_count=pred_count,
+                        unique_count=unique_count,
+                        device=self.active_device.label,
+                        fps=self._fps_ema,
+                    )
+                if (
+                    self.video_alert_enabled and self.alert_roi is not None
+                ) or self.event_recorder.is_active:
+                    started = self.event_recorder.add_frame(
+                        res,
+                        fps=self._fps_ema,
+                        trigger=bool(
+                            alert_triggered
+                            and self.video_alert_enabled
+                            and self.alert_roi is not None
+                        ),
+                        metadata={
+                            "source": source_name,
+                            "frame": "实时" if is_camera else frame_no,
+                            "track_ids": sorted(inside_ids),
+                            "device": self.active_device.label,
+                            "model": self.video_model_name,
+                        },
+                    )
+                    if started:
+                        self.log("[ALERT] 已开始保存报警前后视频")
                 self._schedule_video_ui_update(
                     fv,
                     ir_show,
@@ -1029,10 +1856,15 @@ class MainApp:
                     pred_count,
                     self._fps_ema,
                 )
-                if elapsed < delay:
-                    time.sleep(delay - elapsed)
-                elif not is_camera:
-                    skip_accum += elapsed / delay - 1.0
+                loop_elapsed = time.perf_counter() - frame_t0
+                if loop_elapsed < delay:
+                    time.sleep(delay - loop_elapsed)
+                elif (
+                    not is_camera
+                    and self.video_performance_mode != "smooth"
+                    and not self.output_path
+                ):
+                    skip_accum += loop_elapsed / delay - 1.0
                     skip_frames = min(8, int(skip_accum))
                     if skip_frames > 0:
                         skip_accum -= skip_frames
@@ -1046,6 +1878,7 @@ class MainApp:
                 self.log(f"[GUI] 视频推理失败: {e}")
         finally:
             self.video_running = False
+            self.event_recorder.flush()
             self._release_video_io()
             if self.video_worker is threading.current_thread():
                 self.video_worker = None
@@ -1065,15 +1898,34 @@ class MainApp:
         if not p:
             return
         if Path(p).suffix.lower() == ".mp4":
+            if not self.video_running:
+                messagebox.showwarning("提示", "请先启动视频或摄像头推理，再选择MP4录制路径")
+                return
+            output_key = os.path.normcase(os.path.abspath(p))
+            input_keys = {
+                os.path.normcase(os.path.abspath(str(source)))
+                for source in (self.video_source, self.ir_video_source)
+                if isinstance(source, (str, os.PathLike))
+            }
+            if output_key in input_keys:
+                messagebox.showerror("保存失败", "输出视频不能覆盖正在读取的RGB或IR输入视频")
+                return
             self.output_path = p
             self.log(f"[GUI] 视频结果将保存到: {p}")
         else:
-            cv2.imwrite(p, self.latest_result_frame)
+            image = to_uint8(self.latest_result_frame)
+            if image is None or not cv2.imwrite(p, image):
+                messagebox.showerror("保存失败", f"无法写入图片：\n{p}")
+                return
             self.log(f"[GUI] 图片结果已保存到: {p}")
 
     def _on_close(self):
+        self._save_settings()
         self._closing = True
-        self.stop_video()
+        self._camera_scan_generation += 1
+        self.stop_video(wait_timeout=None)
+        self._wait_for_image_worker(timeout=None)
+        self.event_recorder.close()
         self.root.destroy()
 
 

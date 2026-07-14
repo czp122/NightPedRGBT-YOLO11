@@ -1,5 +1,7 @@
 # NightPedRGBT-YOLO11n (Ultralytics) + CBAM + LLVIP (RGBT 6-channel, dynamic pairing)
 
+Current application version: **v1.1.0**
+
 This project is an **Ultralytics official YOLO11** baseline (model YAML compatible with `yolo11n.yaml`), with a **minimal-intrusion patch**:
 
 - **CBAM attention**: added as a new module `CBAM` and a drop-in block `C3k2CBAM`.
@@ -114,6 +116,14 @@ Run the source version:
 .\.venv\Scripts\python.exe gui\app.py
 ```
 
+The source entry points set `MKL_THREADING_LAYER=SEQUENTIAL` before importing PyTorch. This prevents Conda MKL and
+PyTorch from initializing different Intel OpenMP runtimes during ByteTrack inference. Do not use the unsafe
+`KMP_DUPLICATE_LIB_OK=TRUE` workaround.
+
+When running from PyCharm with a Conda interpreter, also set `MKL_THREADING_LAYER=SEQUENTIAL` in the app Run/Debug
+Configuration so the value exists before PyCharm starts Python. A shared `NightPedestrianDetection` run configuration
+is included in `.run/NightPedestrianDetection.run.xml`; select it after opening the project.
+
 On a computer with a supported NVIDIA GPU and driver, install the CUDA-enabled PyTorch build that matches this project:
 
 ```powershell
@@ -123,4 +133,17 @@ powershell -ExecutionPolicy Bypass -File .\install_cuda_acceleration.ps1
 Then start the GUI and keep `device=auto`. A self-contained EXE only includes the PyTorch runtime present when it was built. To create a GPU-capable EXE, run the CUDA installation script first and then run `build_exe.ps1` on the NVIDIA computer.
 
 For 6-channel video on CPU, realtime IR preprocessing uses a reduced NLM search area while preserving NLM denoising and CLAHE. Full-resolution preprocessing remains unchanged for dataset images and training.
+
+## 7. v1.1.0 application features
+
+- Separate `Realtime Detection` and `Dataset Evaluation` control tabs.
+- ByteTrack pedestrian IDs, current count, unique count and alert-entry count.
+- Mouse-drawn alert ROI with audible warning, snapshot, JSON metadata and pre/post-event MP4 recording.
+- RGB/IR frame offset, manual X/Y translation and synchronized dual-camera `grab/retrieve`.
+- Quality, Balanced and Smooth performance modes. Smooth mode performs alternate RGBT inference and reuses tracked boxes without skipping source frames.
+- CSV/JSON detection record export with timestamps, IDs, confidence, boxes, device and FPS.
+- Runtime diagnostics for CPU, GPU, CUDA, PyTorch, OpenCV, model channels and memory usage.
+- Persistent settings under `runs/gui_config/settings.json` in source mode or `%LOCALAPPDATA%/NightPedRGBT` in the packaged application.
+
+Detailed Chinese instructions are available in `docs/v1.1.0使用说明.md`.
 
