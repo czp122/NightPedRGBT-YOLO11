@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from app_utils.preprocess import preprocess_ir_for_model
+from app_utils.preprocess import preprocess_ir_for_model, to_uint8
 
 
 def _ensure_3ch(im: np.ndarray) -> np.ndarray:
@@ -38,6 +38,22 @@ class FusionEngine:
     def preprocess_ir(self, ir_bgr: np.ndarray, realtime: bool = False) -> np.ndarray:
         """Apply denoising and local contrast enhancement to an IR frame."""
         return preprocess_ir_for_model(ir_bgr, realtime=realtime)
+
+    @staticmethod
+    def shift_ir(ir_bgr: np.ndarray, dx: int = 0, dy: int = 0) -> np.ndarray:
+        """Apply a persisted manual translation before RGBT fusion and inference."""
+        ir = _ensure_3ch(ir_bgr)
+        if ir is None or (int(dx) == 0 and int(dy) == 0):
+            return ir
+        matrix = np.float32([[1, 0, int(dx)], [0, 1, int(dy)]])
+        return cv2.warpAffine(
+            ir,
+            matrix,
+            (ir.shape[1], ir.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
 
     @staticmethod
     def _align_modalities(rgb: np.ndarray, ir: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -90,7 +106,7 @@ class FusionEngine:
     def for_model_with_preprocessed_ir(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
         """Use an already-preprocessed IR image to avoid duplicate denoising/CLAHE work."""
         rgb = _ensure_3ch(rgb_bgr)
-        ir = _ensure_3ch(ir_bgr)
+        ir = to_uint8(_ensure_3ch(ir_bgr))
         if rgb is None or ir is None:
             raise ValueError("rgb/ir input must not be None")
         if ir.shape[:2] != rgb.shape[:2]:
@@ -100,7 +116,7 @@ class FusionEngine:
     def for_display_with_preprocessed_ir(self, rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
         """Build the display fusion image using an already-preprocessed IR image."""
         rgb = _ensure_3ch(rgb_bgr)
-        ir = _ensure_3ch(ir_bgr)
+        ir = to_uint8(_ensure_3ch(ir_bgr))
         if rgb is None or ir is None:
             raise ValueError("rgb/ir input must not be None")
 
@@ -116,3 +132,15 @@ class FusionEngine:
 
         out = cv2.addWeighted(rgb_disp, w_rgb, ir_color, w_ir, 0.0)
         return out
+
+    @staticmethod
+    def for_display_fast(rgb_bgr: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
+        """Build a low-latency preview for frames that reuse the previous detection result."""
+        rgb = _ensure_3ch(rgb_bgr)
+        ir = to_uint8(_ensure_3ch(ir_bgr))
+        if rgb is None or ir is None:
+            raise ValueError("rgb/ir input must not be None")
+        if ir.shape[:2] != rgb.shape[:2]:
+            ir = cv2.resize(ir, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        ir_color = cv2.applyColorMap(cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY), cv2.COLORMAP_JET)
+        return cv2.addWeighted(rgb, 0.62, ir_color, 0.38, 0.0)

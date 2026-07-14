@@ -1,17 +1,22 @@
-夜间行人检测系统 Windows 运行版
+夜间行人检测系统 v1.1.0 Windows运行版
 
 1. 请保留整个 NightPedestrianDetection 文件夹，不要只复制 exe。
 2. 双击 NightPedestrianDetection.exe 启动，不需要安装 Python。
-3. 点击“自动摄像头”：
+3. “实时检测”页可加载RGB/IR视频、自动摄像头或手动RGB+IR双摄像头。
+4. 点击“自动摄像头”：
    - 优先使用外接普通摄像头，并自动切换3通道模型。
    - 识别到名称含 Infrared、IR Camera、Thermal、FLIR、红外或热成像的设备时，自动组合 RGB+IR，并切换6通道模型。
    - 没有外接摄像头时，自动使用电脑内置前置摄像头和3通道模型。
-4. 红外摄像头名称无法自动判断时，使用“手动RGB+IR”，分别输入RGB和IR摄像头编号。
-5. 请在 Windows 设置中允许桌面应用访问摄像头，并关闭可能占用摄像头的其他程序。
-6. device 保持 auto：程序优先使用打包环境中可用的 NVIDIA CUDA GPU，否则自动使用 CPU。
-7. 状态栏会显示实际设备、检测耗时和 FPS；若只显示 CPU，说明当前发布包不含 CUDA 版 PyTorch 或电脑无可用 NVIDIA GPU。
-8. 6通道视频在 CPU 上推荐 imgsz=320 或 384、倍速=1.0；GPU 可从 imgsz=384 开始测试。
-9. 图片结果默认保存到“本地应用数据\NightPedRGBT\runs\gui_results”。
+5. 红外摄像头名称无法自动判断时，使用“手动RGB+IR”，分别输入RGB和IR摄像头编号。
+6. 跟踪开启后显示行人ID、当前人数和累计人数。
+7. 点击“设置警戒区”，在Result画面中拖动鼠标；行人进入后报警并保存截图、事件JSON和报警前后MP4。
+8. “同步校准”可设置IR帧偏移和水平/垂直像素偏移。正帧偏移会预先跳过IR帧，负值会预先跳过RGB帧。
+9. 性能模式：精度=完整预处理；均衡=实时预处理；流畅=6通道隔帧推理且不跳读源视频。
+10. “导出记录”支持CSV/JSON，“设备信息”显示CPU、GPU、CUDA、模型和FPS信息。
+11. 请在 Windows 设置中允许桌面应用访问摄像头，并关闭可能占用摄像头的其他程序。
+12. 设备保持auto：程序优先使用打包环境中可用的NVIDIA CUDA GPU，否则自动使用CPU。
+13. 6通道CPU推荐imgsz=320或384；GPU可从imgsz=384开始测试。
+14. 结果保存在“本地应用数据\NightPedRGBT\runs\gui_results”，报警文件在其events子目录。
 
 内置模型：
 - RGB 3通道：yolo11n.pt

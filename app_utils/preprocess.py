@@ -4,6 +4,29 @@ import cv2
 import numpy as np
 
 
+def to_uint8(im: np.ndarray | None) -> np.ndarray | None:
+    """Convert camera or TIFF data to uint8 without wrapping 16-bit values."""
+    if im is None or im.dtype == np.uint8:
+        return im
+    array = np.asarray(im)
+    if array.dtype == np.bool_:
+        return array.astype(np.uint8) * 255
+
+    work = array.astype(np.float32, copy=False)
+    finite = work[np.isfinite(work)]
+    if finite.size == 0:
+        return np.zeros(array.shape, dtype=np.uint8)
+    minimum = float(finite.min())
+    maximum = float(finite.max())
+    if minimum >= 0.0 and maximum <= 1.0:
+        scaled = work * 255.0
+        return np.nan_to_num(np.clip(scaled, 0, 255), nan=0.0).astype(np.uint8)
+    if maximum <= minimum:
+        return np.zeros(array.shape, dtype=np.uint8)
+    scaled = (work - minimum) * (255.0 / (maximum - minimum))
+    return np.nan_to_num(np.clip(scaled, 0, 255), nan=0.0).astype(np.uint8)
+
+
 def ensure_3ch(im: np.ndarray | None) -> np.ndarray | None:
     """Return an HxWx3 image while preserving BGR channel order."""
     if im is None:
@@ -27,7 +50,7 @@ def preprocess_ir_for_model(
     if ir is None:
         return None
 
-    gray = cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY)
+    gray = to_uint8(cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY))
     work = gray
     if realtime and max(gray.shape) > realtime_max_side:
         scale = realtime_max_side / max(gray.shape)

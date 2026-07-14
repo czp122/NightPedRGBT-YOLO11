@@ -11,10 +11,7 @@ try:
 
     assert lap.__version__  # verify package is not directory
 except (ImportError, AssertionError, AttributeError):
-    from ultralytics.utils.checks import check_requirements
-
-    check_requirements("lap>=0.5.12")  # https://github.com/gatagat/lap
-    import lap
+    lap = None
 
 
 def linear_assignment(cost_matrix: np.ndarray, thresh: float, use_lap: bool = True):
@@ -39,7 +36,7 @@ def linear_assignment(cost_matrix: np.ndarray, thresh: float, use_lap: bool = Tr
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
 
-    if use_lap:
+    if use_lap and lap is not None:
         # Use lap.lapjv
         # https://github.com/gatagat/lap
         _, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)

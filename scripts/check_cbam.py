@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
+os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 import torch
 

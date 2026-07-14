@@ -6,18 +6,19 @@ import os
 import sys
 from pathlib import Path
 
+os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yaml
 
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
-DEFAULT_ENV = ROOT / "configs" / "experiments" / "exp3_yolo11s_800.env"
+DEFAULT_ENV = ROOT / ".env"
 
 from rgbt_config import AppConfig
 from rgbt.patch_ultralytics import apply_rgbt_llvip_patch, llvip_sanity_check
@@ -113,8 +114,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    env_path = Path(args.env).expanduser().resolve() if args.env else DEFAULT_ENV.resolve()
+    env_path = Path(args.env).expanduser() if args.env else DEFAULT_ENV
+    if not env_path.is_absolute():
+        env_path = ROOT / env_path
+    env_path = env_path.resolve()
+    if not env_path.is_file():
+        raise FileNotFoundError(
+            f"Training config not found: {env_path}. Copy .env.example to .env and set LLVIP_ROOT."
+        )
     cfg = AppConfig.from_env(str(env_path))
+    if not cfg.llvip_root.strip():
+        raise ValueError(f"LLVIP_ROOT is empty in training config: {env_path}")
+    if not 32 <= cfg.imgsz <= 2048:
+        raise ValueError(f"IMGSZ must be between 32 and 2048, got {cfg.imgsz}")
+    if cfg.epochs < 1:
+        raise ValueError(f"EPOCHS must be at least 1, got {cfg.epochs}")
+    if cfg.batch == 0 or cfg.batch < -1:
+        raise ValueError(f"BATCH must be -1 or a positive integer, got {cfg.batch}")
 
     print(f"[Config] Using env file: {env_path}")
     print(f"[Config] Run name: {cfg.name}")
@@ -129,11 +145,23 @@ def main() -> None:
 
     from ultralytics import YOLO
 
-    model_yaml = str((ROOT / cfg.model_yaml).resolve())
+    model_yaml_path = (ROOT / cfg.model_yaml).resolve()
+    if not model_yaml_path.is_file():
+        raise FileNotFoundError(f"Model YAML not found: {model_yaml_path}")
+    model_yaml = str(model_yaml_path)
     weights = (cfg.weights or "").strip()
     use_finetune = bool(weights)
-    model_source = weights if use_finetune else model_yaml
+    weights_path = Path(weights).expanduser()
+    if use_finetune and not weights_path.is_absolute():
+        weights_path = (ROOT / weights_path).resolve()
+    if use_finetune and not weights_path.is_file():
+        raise FileNotFoundError(f"Fine-tuning weights not found: {weights_path}")
+    model_source = str(weights_path) if use_finetune else model_yaml
     model = YOLO(model_source)
+    project_path = Path(cfg.project).expanduser()
+    if not project_path.is_absolute():
+        project_path = ROOT / project_path
+    project_path = project_path.resolve()
 
     results = model.train(
         data=data_yaml,
@@ -153,12 +181,12 @@ def main() -> None:
         plots=bool(cfg.plots),
         val=True,
         save=True,
-        project=cfg.project,
+        project=str(project_path),
         name=cfg.name,
         verbose=False,
     )
 
-    save_dir = Path(getattr(results, "save_dir", ROOT / cfg.project / cfg.name))
+    save_dir = Path(getattr(results, "save_dir", project_path / cfg.name))
     csv_path = save_dir / "results.csv"
     _plot_metrics_csv(csv_path)
 
