@@ -1,0 +1,15 @@
+{
+  "model": "rgbt_best.pt",
+  "source_run": "rgbt_yolo11n_cbam11_ft960_irprep4",
+  "input_channels": 6,
+  "training_image_size": 960,
+  "completed_epochs": 15,
+  "precision": 0.93003,
+  "recall": 0.85401,
+  "map50": 0.93032,
+  "map50_95": 0.58216,
+  "validation_box_loss": 1.37455,
+  "validation_classification_loss": 0.76862,
+  "validation_dfl_loss": 1.56958,
+  "sha256": "14AEC0ACF49DF2AAB8C36A66746234799A380490C09696F911DA500F41FAF9CE"
+}

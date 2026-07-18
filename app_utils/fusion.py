@@ -35,9 +35,18 @@ class FusionEngine:
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if self.use_clahe else None
         print("[FusionEngine] Initialized (adaptive RGBT fusion enabled)")
 
-    def preprocess_ir(self, ir_bgr: np.ndarray, realtime: bool = False) -> np.ndarray:
+    def preprocess_ir(
+        self,
+        ir_bgr: np.ndarray,
+        realtime: bool = False,
+        realtime_max_side: int = 320,
+    ) -> np.ndarray:
         """Apply denoising and local contrast enhancement to an IR frame."""
-        return preprocess_ir_for_model(ir_bgr, realtime=realtime)
+        return preprocess_ir_for_model(
+            ir_bgr,
+            realtime=realtime,
+            realtime_max_side=realtime_max_side,
+        )
 
     @staticmethod
     def shift_ir(ir_bgr: np.ndarray, dx: int = 0, dy: int = 0) -> np.ndarray:
@@ -124,7 +133,10 @@ class FusionEngine:
             ir = cv2.resize(ir, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
 
         rgb_disp = _safe_clahe_bgr(rgb.copy(), self.clahe) if self.clahe is not None else rgb.copy()
-        rgb_disp, ir = self._align_modalities(rgb_disp, ir)
+
+        # Keep preview and model input spatially identical. Camera calibration is
+        # applied once by shift_ir before both paths; the old edge-centroid
+        # heuristic moved only the preview and could make correct detections look off.
 
         ir_gray = cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY)
         ir_color = cv2.applyColorMap(ir_gray, cv2.COLORMAP_JET)

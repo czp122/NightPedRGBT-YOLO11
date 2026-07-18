@@ -68,6 +68,9 @@ class AppConfig:
     cache: bool = False
     patience: int = 30
     plots: bool = True
+    audit_data: bool = True
+    strict_data_audit: bool = False
+    resume: bool = False
     seed: int = 0
     project: str = "runs"
     name: str = "llvip_yolo11n_rgbt_cbam"
@@ -111,6 +114,12 @@ class AppConfig:
             cache=_get_bool(e.get("CACHE", str(cls.cache)), cls.cache),
             patience=gi("PATIENCE", cls.patience),
             plots=_get_bool(e.get("PLOTS", str(cls.plots)), cls.plots),
+            audit_data=_get_bool(e.get("AUDIT_DATA", str(cls.audit_data)), cls.audit_data),
+            strict_data_audit=_get_bool(
+                e.get("STRICT_DATA_AUDIT", str(cls.strict_data_audit)),
+                cls.strict_data_audit,
+            ),
+            resume=_get_bool(e.get("RESUME", str(cls.resume)), cls.resume),
             seed=gi("SEED", cls.seed),
             project=e.get("PROJECT", cls.project),
             name=e.get("NAME", cls.name),

@@ -43,7 +43,31 @@ Copy-Item `
 if (Test-Path -LiteralPath $zip) {
     Remove-Item -LiteralPath $zip -Force
 }
-Compress-Archive -Path (Join-Path $dist "NightPedestrianDetection") -DestinationPath $zip -CompressionLevel Optimal
+$compressed = $false
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+    try {
+        if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+        }
+        Compress-Archive `
+            -Path (Join-Path $dist "NightPedestrianDetection") `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal `
+            -ErrorAction Stop
+        $compressed = $true
+        break
+    }
+    catch {
+        if ($attempt -eq 5) {
+            throw
+        }
+        Write-Warning "ZIP compression attempt $attempt failed; retrying after file locks settle. $($_.Exception.Message)"
+        Start-Sleep -Seconds (2 * $attempt)
+    }
+}
+if (-not $compressed) {
+    throw "ZIP compression failed: $zip"
+}
 
 Write-Host "EXE: $(Join-Path $dist 'NightPedestrianDetection\NightPedestrianDetection.exe')"
 Write-Host "ZIP: $zip"
