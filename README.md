@@ -1,6 +1,6 @@
 # NightPedRGBT-YOLO11n (Ultralytics) + CBAM + LLVIP (RGBT 6-channel, dynamic pairing)
 
-Current application version: **v1.1.0**
+Current application version: **v1.2.0**
 
 This project is an **Ultralytics official YOLO11** baseline (model YAML compatible with `yolo11n.yaml`), with a **minimal-intrusion patch**:
 
@@ -46,8 +46,11 @@ pip install -r requirements.txt
 
 The script will:
 - auto-generate `runs/llvip_rgbt_data.yaml`
+- audit RGB/IR pairs, labels, and train/val/test sample-ID overlap before training
 - patch Ultralytics at runtime to load 6ch RGBT
 - run **official Ultralytics trainer** (prints P/R/F1/mAP)
+
+Set `STRICT_DATA_AUDIT=1` to stop training on missing pairs/labels or split leakage. To resume an interrupted run with optimizer and scheduler state intact, set `RESUME=1` and point `WEIGHTS` to that run's `last.pt`. Keep `RESUME=0` when intentionally fine-tuning from `best.pt`.
 
 
 ## 2.5. Switchable experiment configs
@@ -132,7 +135,7 @@ powershell -ExecutionPolicy Bypass -File .\install_cuda_acceleration.ps1
 
 Then start the GUI and keep `device=auto`. A self-contained EXE only includes the PyTorch runtime present when it was built. To create a GPU-capable EXE, run the CUDA installation script first and then run `build_exe.ps1` on the NVIDIA computer.
 
-For 6-channel video on CPU, realtime IR preprocessing uses a reduced NLM search area while preserving NLM denoising and CLAHE. Full-resolution preprocessing remains unchanged for dataset images and training.
+For 6-channel video, the three performance profiles now control both inference resolution and IR working resolution. Quality uses at least 640 inference pixels and full IR processing; Balanced uses 384-640 inference pixels and a 384-pixel IR work image; Smooth caps inference at 320, uses a 256-pixel IR work image, and performs alternate-frame inference. Full-resolution preprocessing remains unchanged for dataset images and training.
 
 ## 7. v1.1.0 application features
 
@@ -147,3 +150,10 @@ For 6-channel video on CPU, realtime IR preprocessing uses a reduced NLM search 
 
 Detailed Chinese instructions are available in `docs/v1.1.0使用说明.md`.
 
+## 8. v1.2.0 interface update
+
+- Detection result promoted to a large primary view, with RGB, IR and fusion previews in a side column.
+- Explicit start button enabled only after the selected model has all required RGB/IR inputs.
+- Night-friendly dark theme, live count/FPS/latency/device cards and clear running/paused/alarm states.
+- Advanced inference options and runtime logs are collapsed by default to preserve viewing space.
+- Double-click any image panel to open a maximized preview; press Esc or double-click again to close it.

@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_ENV = ROOT / ".env"
 
 from rgbt_config import AppConfig
+from rgbt.dataset_audit import audit_llvip_dataset, print_dataset_audit
 from rgbt.patch_ultralytics import apply_rgbt_llvip_patch, llvip_sanity_check
 
 
@@ -131,15 +132,28 @@ def main() -> None:
         raise ValueError(f"EPOCHS must be at least 1, got {cfg.epochs}")
     if cfg.batch == 0 or cfg.batch < -1:
         raise ValueError(f"BATCH must be -1 or a positive integer, got {cfg.batch}")
+    if cfg.resume and not cfg.weights.strip():
+        raise ValueError("RESUME=1 requires WEIGHTS to point to the previous run's last.pt")
 
     print(f"[Config] Using env file: {env_path}")
     print(f"[Config] Run name: {cfg.name}")
     print(f"[Config] Model YAML: {cfg.model_yaml}")
     if cfg.weights:
-        print(f"[Config] Fine-tuning from: {cfg.weights}")
+        action = "Resuming from" if cfg.resume else "Fine-tuning from"
+        print(f"[Config] {action}: {cfg.weights}")
     print(f"[Config] Optimizer: {cfg.optimizer}, lr0={cfg.lr0}")
 
     llvip_sanity_check(cfg.llvip_root)
+    if cfg.audit_data:
+        audit_report = audit_llvip_dataset(
+            cfg.llvip_root,
+            {
+                "train": cfg.train_split,
+                "val": cfg.val_split,
+                "test": cfg.test_split,
+            },
+        )
+        print_dataset_audit(audit_report, strict=cfg.strict_data_audit)
     apply_rgbt_llvip_patch()
     data_yaml = write_llvip_data_yaml(cfg)
 
@@ -163,28 +177,34 @@ def main() -> None:
         project_path = ROOT / project_path
     project_path = project_path.resolve()
 
-    results = model.train(
-        data=data_yaml,
-        imgsz=cfg.imgsz,
-        epochs=cfg.epochs,
-        batch=cfg.batch,
-        workers=cfg.workers,
-        device=cfg.device,
-        lr0=cfg.lr0,
-        weight_decay=cfg.weight_decay,
-        optimizer=cfg.optimizer,
-        amp=bool(cfg.amp),
-        cache=bool(cfg.cache),
-        seed=cfg.seed,
-        pretrained=use_finetune,
-        patience=cfg.patience,
-        plots=bool(cfg.plots),
-        val=True,
-        save=True,
-        project=str(project_path),
-        name=cfg.name,
-        verbose=False,
-    )
+    if cfg.resume:
+        # Ultralytics restores optimizer, scheduler, epoch and original arguments
+        # from last.pt. Passing a fresh set of training arguments would turn this
+        # into fine-tuning rather than a true interrupted-run resume.
+        results = model.train(resume=True)
+    else:
+        results = model.train(
+            data=data_yaml,
+            imgsz=cfg.imgsz,
+            epochs=cfg.epochs,
+            batch=cfg.batch,
+            workers=cfg.workers,
+            device=cfg.device,
+            lr0=cfg.lr0,
+            weight_decay=cfg.weight_decay,
+            optimizer=cfg.optimizer,
+            amp=bool(cfg.amp),
+            cache=bool(cfg.cache),
+            seed=cfg.seed,
+            pretrained=use_finetune,
+            patience=cfg.patience,
+            plots=bool(cfg.plots),
+            val=True,
+            save=True,
+            project=str(project_path),
+            name=cfg.name,
+            verbose=False,
+        )
 
     save_dir = Path(getattr(results, "save_dir", project_path / cfg.name))
     csv_path = save_dir / "results.csv"

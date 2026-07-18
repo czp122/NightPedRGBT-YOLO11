@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 
 
+_IR_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
 def to_uint8(im: np.ndarray | None) -> np.ndarray | None:
     """Convert camera or TIFF data to uint8 without wrapping 16-bit values."""
     if im is None or im.dtype == np.uint8:
@@ -45,13 +48,18 @@ def preprocess_ir_for_model(
     realtime: bool = False,
     realtime_max_side: int = 320,
 ) -> np.ndarray | None:
-    """Apply grayscale, NLM denoising and CLAHE; realtime mode reduces video latency."""
+    """Apply grayscale, NLM denoising and CLAHE; realtime mode reduces video latency.
+
+    The returned image keeps the source resolution. ``realtime_max_side`` only
+    limits the temporary working resolution used by the expensive NLM stage.
+    """
     ir = ensure_3ch(ir_bgr)
     if ir is None:
         return None
 
     gray = to_uint8(cv2.cvtColor(ir, cv2.COLOR_BGR2GRAY))
     work = gray
+    realtime_max_side = max(64, int(realtime_max_side))
     if realtime and max(gray.shape) > realtime_max_side:
         scale = realtime_max_side / max(gray.shape)
         work = cv2.resize(
@@ -69,8 +77,7 @@ def preprocess_ir_for_model(
         templateWindowSize=template_window,
         searchWindowSize=search_window,
     )
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
+    enhanced = _IR_CLAHE.apply(denoised)
     if enhanced.shape != gray.shape:
         enhanced = cv2.resize(
             enhanced,

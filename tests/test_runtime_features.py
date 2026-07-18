@@ -13,10 +13,26 @@ from app_utils.camera import CameraDevice, choose_auto_camera_setup
 from app_utils.fusion import FusionEngine
 from app_utils.session import DetectionRecorder, EventClipRecorder, SettingsStore
 from app_utils.preprocess import preprocess_ir_for_model
+from app_utils.system_info import _format_windows_version
 from gui.app import MainApp
+from rgbt.dataset_audit import audit_llvip_dataset, print_dataset_audit
 
 
 class RuntimeFeatureTests(unittest.TestCase):
+    def test_windows_11_build_is_not_labeled_windows_10(self):
+        result = _format_windows_version(
+            "Windows 10 Pro",
+            "23H2",
+            22631,
+            3155,
+            "AMD64",
+        )
+        self.assertEqual(result, "Windows 11 Pro 23H2 (Build 22631.3155, AMD64)")
+
+    def test_windows_10_build_keeps_windows_10_label(self):
+        result = _format_windows_version("Windows 10 Pro", "22H2", 19045, 4046)
+        self.assertEqual(result, "Windows 10 Pro 22H2 (Build 19045.4046)")
+
     def test_settings_and_detection_exports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,6 +101,60 @@ class RuntimeFeatureTests(unittest.TestCase):
         )
         self.assertEqual(preview.dtype, np.uint8)
         self.assertEqual(preview.shape, (24, 32, 3))
+
+    def test_performance_profiles_change_inference_resolution(self):
+        settings = {"imgsz": 384, "conf": 0.25, "iou": 0.45}
+        self.assertEqual(MainApp._video_profile_settings(settings, "quality")["imgsz"], 640)
+        self.assertEqual(MainApp._video_profile_settings(settings, "balanced")["imgsz"], 384)
+        self.assertEqual(MainApp._video_profile_settings(settings, "smooth")["imgsz"], 320)
+        self.assertEqual(settings["imgsz"], 384)
+
+    def test_start_button_requires_complete_rgbt_input(self):
+        app = MainApp.__new__(MainApp)
+        app.current_model = object()
+        app.model_var = SimpleNamespace(get=lambda: "rgbt")
+        app.model_channels = {"rgbt": 6}
+        app.video_source = "visible.mp4"
+        app.ir_video_source = None
+        app.video_running = False
+        source_text = []
+        button_state = {}
+        app.source_status_var = SimpleNamespace(set=source_text.append)
+        app.start_button = SimpleNamespace(config=lambda **kwargs: button_state.update(kwargs))
+        app._refresh_source_readiness()
+        self.assertEqual(button_state["state"], "disabled")
+        self.assertIn("IR 未选择", source_text[-1])
+
+        app.ir_video_source = "infrared.mp4"
+        app._refresh_source_readiness()
+        self.assertEqual(button_state["state"], "normal")
+
+    def test_display_does_not_apply_preview_only_alignment(self):
+        engine = FusionEngine(use_clahe=False)
+        rgb = np.zeros((32, 48, 3), dtype=np.uint8)
+        ir = np.zeros_like(rgb)
+        with patch.object(engine, "_align_modalities", side_effect=AssertionError("unexpected")):
+            preview = engine.for_display_with_preprocessed_ir(rgb, ir)
+        self.assertEqual(preview.shape, rgb.shape)
+
+    def test_dataset_audit_detects_split_leakage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split in ("train", "val", "test"):
+                for modality in ("visible", "infrared"):
+                    (root / modality / split / "images").mkdir(parents=True)
+                (root / "visible" / split / "labels").mkdir(parents=True)
+            for split, stem in (("train", "train_only"), ("val", "duplicate"), ("test", "duplicate")):
+                (root / "visible" / split / "images" / f"{stem}.jpg").write_bytes(b"image")
+                (root / "infrared" / split / "images" / f"{stem}.jpg").write_bytes(b"image")
+                (root / "visible" / split / "labels" / f"{stem}.txt").write_text("", encoding="utf-8")
+            report = audit_llvip_dataset(
+                root,
+                {name: f"visible/{name}/images" for name in ("train", "val", "test")},
+            )
+            self.assertEqual(report["overlaps"]["val-test"]["count"], 1)
+            with self.assertRaises(ValueError):
+                print_dataset_audit(report, strict=True)
 
     def test_event_clip_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +231,27 @@ class RuntimeFeatureTests(unittest.TestCase):
         self.assertTrue(triggered)
         self.assertEqual(unique, 3)
         self.assertEqual(app._alert_entry_count, 3)
+
+    def test_alert_roi_uses_pedestrian_foot_point(self):
+        app = MainApp.__new__(MainApp)
+        app.video_alert_enabled = True
+        app.video_tracking_enabled = True
+        app.alert_roi = (0.0, 0.75, 1.0, 1.0)
+        app._seen_track_ids = set()
+        app._inside_track_ids = set()
+        app._anonymous_inside_count = 0
+        app._anonymous_scene_count = 0
+        app._anonymous_seen_count = 0
+        app._alert_entry_count = 0
+        app._alert_flash_until = 0.0
+        app.count_var = type("Counter", (), {"set": lambda self, value: None})()
+        app._post_ui = lambda callback, *args: callback(*args)
+        app.log = lambda message: None
+        app._play_alarm_sound = lambda: None
+        detections = [{"box": (10, 10, 20, 35), "confidence": 0.9, "track_id": 1}]
+        inside, triggered, _unique = app._evaluate_alert(detections, (40, 40, 3))
+        self.assertEqual(inside, {1})
+        self.assertTrue(triggered)
 
     def test_stop_timeout_does_not_release_live_worker_resources(self):
         app = MainApp.__new__(MainApp)

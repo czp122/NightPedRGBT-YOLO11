@@ -68,6 +68,7 @@ from app_utils.data_loader import DatasetManager
 from app_utils.fusion import FusionEngine
 from app_utils.preprocess import to_uint8
 from app_utils.session import DetectionRecorder, EventClipRecorder, SettingsStore, normalize_settings
+from app_utils.system_info import get_cpu_name, get_os_display_name
 from app_utils.version import APP_VERSION
 
 try:
@@ -77,17 +78,42 @@ except ImportError:
 
 
 class MainApp:
+    COLORS = {
+        "bg": "#0b1120",
+        "panel": "#111827",
+        "panel_alt": "#172033",
+        "border": "#263247",
+        "text": "#e5edf7",
+        "muted": "#8fa1b8",
+        "accent": "#2f80ed",
+        "accent_hover": "#4b95f5",
+        "success": "#22c55e",
+        "warning": "#f59e0b",
+        "danger": "#ef4444",
+        "image": "#050914",
+    }
     PERFORMANCE_LABELS = {
         "精度": "quality",
         "均衡": "balanced",
         "流畅": "smooth",
     }
+    IR_PREPROCESS_MAX_SIDE = {
+        "quality": None,
+        "balanced": 384,
+        "smooth": 256,
+    }
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"夜间行人检测系统 v{APP_VERSION} (RGB 3ch / RGBT 6ch + YOLO11)")
-        self.root.geometry("1500x900")
-        self.root.minsize(1200, 700)
+        self.root.title(f"夜间行人智能检测系统 v{APP_VERSION}")
+        screen_width = max(1024, self.root.winfo_screenwidth())
+        screen_height = max(720, self.root.winfo_screenheight())
+        window_width = min(1500, max(1100, screen_width - 40))
+        window_height = min(900, max(650, screen_height - 90))
+        window_x = max(0, (screen_width - window_width) // 2)
+        window_y = max(0, (screen_height - window_height) // 3)
+        self.root.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
+        self.root.minsize(min(1100, window_width), min(650, window_height))
 
         self.cpu_threads = configure_compute_runtime()
         self.active_device = resolve_compute_device("auto", self.cpu_threads)
@@ -122,11 +148,20 @@ class MainApp:
         self.alert_var = tk.BooleanVar(value=bool(self.settings.get("alert_enabled", True)))
         self.count_var = tk.StringVar(value="当前:0  累计:0  进入警戒区:0")
         self.info_var = tk.StringVar(value="请先选择 LLVIP 路径并加载模型")
+        self.run_state_var = tk.StringVar(value="就绪")
+        self.source_status_var = tk.StringVar(value="尚未选择输入源")
+        self.current_count_metric_var = tk.StringVar(value="0")
+        self.unique_count_metric_var = tk.StringVar(value="0")
+        self.alert_count_metric_var = tk.StringVar(value="0")
+        self.fps_metric_var = tk.StringVar(value="--")
+        self.latency_metric_var = tk.StringVar(value="--")
+        self.device_metric_var = tk.StringVar(value=self.active_device.label)
 
         self._lock = threading.Lock()
         self._worker = None
         self._image_pending = False
         self._img_refs = {}
+        self._last_view_images = {}
         self._display_geometry = {}
         self._ui_tasks = queue.SimpleQueue()
         self._video_ui_lock = threading.Lock()
@@ -155,6 +190,8 @@ class MainApp:
         self.alert_roi = tuple(map(float, roi)) if isinstance(roi, list) and len(roi) == 4 else None
         self._roi_selecting = False
         self._roi_drag_start = None
+        self._advanced_expanded = False
+        self._log_expanded = False
 
         self.video_worker = None
         self.video_running = False
@@ -225,7 +262,18 @@ class MainApp:
 
     def _append_log(self, s: str):
         self.log_text.config(state="normal")
-        self.log_text.insert("end", s + "\n")
+        upper = s.upper()
+        if "[ERROR]" in upper or "失败" in s or "出错" in s:
+            tag = "error"
+        elif "[WARN]" in upper or "警告" in s:
+            tag = "warning"
+        elif "[ALERT]" in upper:
+            tag = "alert"
+        elif "[ACCEL]" in upper or "[CAM]" in upper:
+            tag = "accent"
+        else:
+            tag = "normal"
+        self.log_text.insert("end", s + "\n", tag)
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
@@ -242,6 +290,8 @@ class MainApp:
             return
 
         self.active_device = selected
+        if hasattr(self, "device_metric_var"):
+            self.device_metric_var.set(selected.label)
         if device_changed:
             for model in self.models.values():
                 model.predictor = None
@@ -291,6 +341,19 @@ class MainApp:
     def _performance_key(self) -> str:
         return self.PERFORMANCE_LABELS.get(self.performance_var.get(), "balanced")
 
+    @staticmethod
+    def _video_profile_settings(settings: dict, performance_mode: str) -> dict:
+        """Make the performance selector affect inference resolution as advertised."""
+        effective = dict(settings)
+        requested = int(effective["imgsz"])
+        if performance_mode == "quality":
+            effective["imgsz"] = max(requested, 640)
+        elif performance_mode == "smooth":
+            effective["imgsz"] = min(requested, 320)
+        else:
+            effective["imgsz"] = min(max(requested, 384), 640)
+        return effective
+
     def _collect_settings(self) -> dict:
         try:
             predict_settings = self._read_predict_settings()
@@ -333,7 +396,7 @@ class MainApp:
         self._anonymous_scene_count = 0
         self._anonymous_seen_count = 0
         self._alert_entry_count = 0
-        self._post_ui(self.count_var.set, "当前:0  累计:0  进入警戒区:0")
+        self._post_ui(self._set_count_metrics, 0, 0, 0)
         predictor = getattr(self.current_model, "predictor", None)
         for tracker in getattr(predictor, "trackers", []) or []:
             try:
@@ -498,9 +561,9 @@ class MainApp:
         cuda_available = torch.cuda.is_available()
         lines = [
             f"软件版本: v{APP_VERSION}",
-            f"系统: {platform.platform()}",
+            f"系统: {get_os_display_name()}",
             f"Python: {platform.python_version()}",
-            f"CPU: {platform.processor() or 'Unknown'}",
+            f"CPU: {get_cpu_name()}",
             f"CPU逻辑核心: {os.cpu_count() or 1}",
             f"PyTorch: {torch.__version__}",
             f"OpenCV: {cv2.__version__}",
@@ -553,22 +616,57 @@ class MainApp:
         self._on_runtime_option_change()
 
     def _build_ui(self):
-        top = tk.Frame(self.root, bg="#eaeaea", pady=6)
-        top.pack(side=tk.TOP, fill=tk.X)
+        c = self.COLORS
+        self.root.configure(bg=c["bg"])
+        self._configure_styles()
 
-        tk.Label(top, text="模型:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
+        header = tk.Frame(self.root, bg=c["panel"], padx=12, pady=9)
+        header.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(
+            header,
+            text="夜间行人智能检测",
+            bg=c["panel"],
+            fg=c["text"],
+            font=("Microsoft YaHei UI", 16, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            header,
+            text=f"YOLO11 · RGBT  |  v{APP_VERSION}",
+            bg=c["panel"],
+            fg=c["muted"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side=tk.LEFT, padx=(12, 0), pady=(5, 0))
+        self.run_state_badge = tk.Label(
+            header,
+            textvariable=self.run_state_var,
+            bg=c["success"],
+            fg="#ffffff",
+            padx=14,
+            pady=4,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.run_state_badge.pack(side=tk.RIGHT)
+
+        self.toolbar_container = tk.Frame(self.root, bg=c["panel_alt"], padx=10, pady=7)
+        self.toolbar_container.pack(side=tk.TOP, fill=tk.X)
+        top = tk.Frame(self.toolbar_container, bg=c["panel_alt"])
+        top.pack(fill=tk.X)
+
+        tk.Label(top, text="模型", bg=c["panel_alt"], fg=c["muted"]).pack(side=tk.LEFT, padx=(2, 5))
         self.model_combo = ttk.Combobox(
             top,
             textvariable=self.model_var,
             values=[],
-            width=22,
+            width=25,
             state="readonly",
         )
         self.model_combo.pack(side=tk.LEFT, padx=4)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
-        tk.Button(top, text="+ 加载模型(.pt)", command=self.load_custom_model).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="加载模型", command=self.load_custom_model, style="Secondary.TButton").pack(
+            side=tk.LEFT, padx=(2, 10)
+        )
 
-        tk.Label(top, text="设备:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
+        tk.Label(top, text="设备", bg=c["panel_alt"], fg=c["muted"]).pack(side=tk.LEFT, padx=(2, 5))
         self.device_combo = ttk.Combobox(
             top,
             textvariable=self.device_var,
@@ -579,13 +677,7 @@ class MainApp:
         self.device_combo.pack(side=tk.LEFT, padx=4)
         self.device_combo.bind("<<ComboboxSelected>>", self._apply_device_selection)
 
-        for text, var in (("imgsz", self.imgsz_var), ("conf", self.conf_var), ("iou", self.iou_var)):
-            tk.Label(top, text=f"{text}:", bg="#eaeaea").pack(side=tk.LEFT, padx=6)
-            entry = tk.Entry(top, textvariable=var, width=6)
-            entry.pack(side=tk.LEFT, padx=4)
-            entry.bind("<Return>", self._apply_predict_settings)
-
-        tk.Label(top, text="性能:", bg="#eaeaea").pack(side=tk.LEFT, padx=(10, 4))
+        tk.Label(top, text="性能", bg=c["panel_alt"], fg=c["muted"]).pack(side=tk.LEFT, padx=(8, 5))
         self.performance_combo = ttk.Combobox(
             top,
             textvariable=self.performance_var,
@@ -600,68 +692,164 @@ class MainApp:
             text="跟踪",
             variable=self.tracking_var,
             command=self._on_runtime_option_change,
-        ).pack(side=tk.LEFT, padx=5)
+            style="Toolbar.TCheckbutton",
+        ).pack(side=tk.LEFT, padx=(9, 3))
         ttk.Checkbutton(
             top,
             text="警戒",
             variable=self.alert_var,
             command=self._on_runtime_option_change,
-        ).pack(side=tk.LEFT, padx=5)
+            style="Toolbar.TCheckbutton",
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(
+            top,
+            text="高级参数 ▾",
+            command=self._toggle_advanced_controls,
+            style="Ghost.TButton",
+        ).pack(side=tk.LEFT, padx=(8, 3))
+        self.advanced_toggle_button = top.winfo_children()[-1]
+
+        self.stop_button = ttk.Button(
+            top,
+            text="停止",
+            command=self.stop_video,
+            style="Danger.TButton",
+            width=8,
+        )
+        self.stop_button.pack(side=tk.RIGHT, padx=(5, 0))
+        self.start_button = ttk.Button(
+            top,
+            text="▶ 开始检测",
+            command=self.start_video_inference,
+            style="Primary.TButton",
+            width=13,
+            state=tk.DISABLED,
+        )
+        self.start_button.pack(side=tk.RIGHT, padx=5)
+
+        self.advanced_frame = tk.Frame(self.toolbar_container, bg=c["panel_alt"])
+        tk.Label(
+            self.advanced_frame,
+            text="高级推理参数",
+            bg=c["panel_alt"],
+            fg=c["muted"],
+        ).pack(side=tk.LEFT, padx=(2, 10))
+        for text, var in (("输入尺寸", self.imgsz_var), ("置信度", self.conf_var), ("IOU", self.iou_var)):
+            tk.Label(self.advanced_frame, text=text, bg=c["panel_alt"], fg=c["text"]).pack(
+                side=tk.LEFT, padx=(7, 3)
+            )
+            entry = tk.Entry(
+                self.advanced_frame,
+                textvariable=var,
+                width=7,
+                bg=c["bg"],
+                fg=c["text"],
+                insertbackground=c["text"],
+                relief=tk.FLAT,
+            )
+            entry.pack(side=tk.LEFT, ipady=4)
+            entry.bind("<Return>", self._apply_predict_settings)
+        tk.Label(
+            self.advanced_frame,
+            text="修改后按 Enter 应用",
+            bg=c["panel_alt"],
+            fg=c["muted"],
+        ).pack(side=tk.LEFT, padx=12)
 
         controls = ttk.Notebook(self.root)
-        controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(4, 0))
-        realtime_tab = tk.Frame(controls, bg="#f4f4f4", pady=6)
-        evaluation_tab = tk.Frame(controls, bg="#f4f4f4", pady=6)
+        controls.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(7, 0))
+        realtime_tab = tk.Frame(controls, bg=c["panel"], padx=8, pady=7)
+        evaluation_tab = tk.Frame(controls, bg=c["panel"], padx=8, pady=9)
         controls.add(realtime_tab, text="实时检测")
         controls.add(evaluation_tab, text="数据集评估")
 
-        realtime_items = [
-            ("可见光视频", self.open_visible_video, 11),
-            ("红外视频", self.open_ir_video, 9),
-            ("自动摄像头", self.open_auto_camera, 11),
-            ("手动RGB+IR", self.open_rgbt_cameras, 11),
-            ("暂停/继续", self.toggle_pause_video, 9),
-            ("停止", self.stop_video, 7),
-            ("保存结果", self.save_current_result, 9),
-            ("设置警戒区", self.toggle_roi_selection, 10),
-            ("清除警戒区", self.clear_alert_roi, 10),
-            ("同步校准", self.open_sync_settings, 9),
-            ("导出记录", self.export_detection_records, 9),
-            ("设备信息", self.show_device_diagnostics, 9),
-        ]
-        for index, (text, command, width) in enumerate(realtime_items):
-            tk.Button(realtime_tab, text=text, command=command, width=width).grid(
-                row=index // 6,
-                column=index % 6,
-                padx=3,
-                pady=2,
-                sticky="w",
+        source_group = self._control_group(realtime_tab, "输入源")
+        source_group.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        for index, (text, command) in enumerate(
+            (("RGB视频", self.open_visible_video), ("红外视频", self.open_ir_video),
+             ("自动摄像头", self.open_auto_camera), ("手动双摄", self.open_rgbt_cameras))
+        ):
+            ttk.Button(source_group, text=text, command=command, style="Secondary.TButton").grid(
+                row=index // 2, column=index % 2, padx=3, pady=3, sticky="ew"
             )
-        tk.Label(realtime_tab, text="倍速", bg="#f4f4f4").grid(row=0, column=6, padx=(10, 2))
+
+        playback_group = self._control_group(realtime_tab, "运行控制")
+        playback_group.pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(
+            playback_group,
+            text="暂停 / 继续",
+            command=self.toggle_pause_video,
+            style="Secondary.TButton",
+        ).grid(row=0, column=0, padx=3, pady=3)
+        tk.Label(playback_group, text="倍速", bg=c["panel_alt"], fg=c["muted"]).grid(
+            row=0, column=1, padx=(8, 3)
+        )
         speed_spinbox = tk.Spinbox(
-            realtime_tab,
+            playback_group,
             from_=0.25,
             to=4.0,
             increment=0.25,
             textvariable=self.speed_var,
             width=5,
             command=self._apply_video_speed,
+            bg=c["bg"],
+            fg=c["text"],
+            buttonbackground=c["panel_alt"],
+            insertbackground=c["text"],
+            relief=tk.FLAT,
         )
-        speed_spinbox.grid(row=0, column=7, padx=2)
+        speed_spinbox.grid(row=0, column=2, padx=3, ipady=3)
         speed_spinbox.bind("<Return>", self._apply_video_speed)
         tk.Label(
-            realtime_tab,
-            textvariable=self.count_var,
-            bg="#f4f4f4",
-            font=("Consolas", 10, "bold"),
-        ).grid(row=1, column=6, columnspan=3, padx=10, sticky="w")
+            playback_group,
+            textvariable=self.source_status_var,
+            bg=c["panel_alt"],
+            fg=c["muted"],
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=3, padx=3, pady=(3, 0), sticky="w")
 
-        tk.Label(evaluation_tab, text="LLVIP路径:", bg="#f4f4f4").pack(side=tk.LEFT, padx=6)
-        self.path_entry = tk.Entry(evaluation_tab, textvariable=self.path_var, width=52)
-        self.path_entry.pack(side=tk.LEFT, padx=4)
-        tk.Button(evaluation_tab, text="浏览", command=self.browse_dataset).pack(side=tk.LEFT, padx=3)
-        tk.Button(evaluation_tab, text="加载/刷新", command=self.load_dataset_from_entry).pack(side=tk.LEFT, padx=3)
-        tk.Label(evaluation_tab, text="子集:", bg="#f4f4f4").pack(side=tk.LEFT, padx=(8, 3))
+        tools_group = self._control_group(realtime_tab, "警戒与输出")
+        tools_group.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        tool_items = (
+            ("设置警戒区", self.toggle_roi_selection),
+            ("清除警戒区", self.clear_alert_roi),
+            ("同步校准", self.open_sync_settings),
+            ("保存结果", self.save_current_result),
+            ("导出记录", self.export_detection_records),
+            ("设备信息", self.show_device_diagnostics),
+        )
+        for index, (text, command) in enumerate(tool_items):
+            ttk.Button(tools_group, text=text, command=command, style="Secondary.TButton").grid(
+                row=index // 2, column=index % 2, padx=3, pady=3, sticky="ew"
+            )
+            tools_group.grid_columnconfigure(index % 2, weight=1)
+
+        tk.Label(evaluation_tab, text="LLVIP路径", bg=c["panel"], fg=c["muted"]).grid(
+            row=0, column=0, padx=(3, 6)
+        )
+        self.path_entry = tk.Entry(
+            evaluation_tab,
+            textvariable=self.path_var,
+            bg=c["bg"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief=tk.FLAT,
+        )
+        self.path_entry.grid(row=0, column=1, sticky="ew", padx=4, ipady=5)
+        evaluation_tab.grid_columnconfigure(1, weight=1)
+        ttk.Button(evaluation_tab, text="浏览", command=self.browse_dataset, style="Secondary.TButton").grid(
+            row=0, column=2, padx=3
+        )
+        ttk.Button(
+            evaluation_tab,
+            text="加载 / 刷新",
+            command=self.load_dataset_from_entry,
+            style="Primary.TButton",
+        ).grid(row=0, column=3, padx=3)
+        tk.Label(evaluation_tab, text="子集", bg=c["panel"], fg=c["muted"]).grid(
+            row=0, column=4, padx=(10, 3)
+        )
         self.split_combo = ttk.Combobox(
             evaluation_tab,
             textvariable=self.split_var,
@@ -669,62 +857,412 @@ class MainApp:
             width=7,
             state="readonly",
         )
-        self.split_combo.pack(side=tk.LEFT, padx=3)
+        self.split_combo.grid(row=0, column=5, padx=3)
         self.split_combo.bind("<<ComboboxSelected>>", self.on_split_change)
-        tk.Button(evaluation_tab, text="< 上一张", command=self.prev_img, width=9).pack(side=tk.LEFT, padx=3)
-        tk.Button(evaluation_tab, text="下一张 >", command=self.next_img, width=9).pack(side=tk.LEFT, padx=3)
+        ttk.Button(evaluation_tab, text="上一张", command=self.prev_img, style="Secondary.TButton").grid(
+            row=0, column=6, padx=(10, 3)
+        )
+        ttk.Button(evaluation_tab, text="下一张", command=self.next_img, style="Secondary.TButton").grid(
+            row=0, column=7, padx=3
+        )
 
-        mid = tk.Frame(self.root, bg="#fff")
-        mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        for i in range(2):
-            mid.grid_rowconfigure(i, weight=1, uniform="r")
-            mid.grid_columnconfigure(i, weight=1, uniform="c")
+        logf = tk.Frame(self.root, bg=c["panel"], highlightthickness=1, highlightbackground=c["border"])
+        self.log_panel = logf
+        log_header = tk.Frame(logf, bg=c["panel"])
+        log_header.pack(fill=tk.X)
+        tk.Label(
+            log_header,
+            text="运行日志",
+            bg=c["panel"],
+            fg=c["text"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=10, pady=5)
+        log_close_button = ttk.Button(
+            log_header,
+            text="收起",
+            command=self._toggle_log_panel,
+            style="Ghost.TButton",
+            width=7,
+        )
+        log_close_button.pack(side=tk.RIGHT, padx=5, pady=2)
+        self.log_body = tk.Frame(logf, bg=c["panel"])
+        self.log_text = tk.Text(
+            self.log_body,
+            height=6,
+            bg="#080d18",
+            fg="#cbd5e1",
+            insertbackground=c["text"],
+            relief=tk.FLAT,
+            font=("Consolas", 9),
+        )
+        self.log_body.pack(fill=tk.X)
+        self.log_text.pack(fill=tk.X, expand=True, padx=8, pady=(0, 8))
+        self.log_text.insert("end", "GUI Ready.\n")
+        self.log_text.tag_configure("normal", foreground="#cbd5e1")
+        self.log_text.tag_configure("accent", foreground="#67e8f9")
+        self.log_text.tag_configure("warning", foreground="#fbbf24")
+        self.log_text.tag_configure("alert", foreground="#fb923c")
+        self.log_text.tag_configure("error", foreground="#f87171")
+        self.log_text.config(state="disabled")
 
-        self.lbl_rgb = self._box(mid, "Visible (RGB)")
-        self.lbl_fusion = self._box(mid, "Fusion View")
-        self.lbl_ir = self._box(mid, "Infrared (IR)")
-        self.lbl_result = self._box(mid, "Result (绿=GT, 红=Pred)")
+        status_bar = tk.Frame(self.root, bg=c["panel_alt"], padx=10, pady=5)
+        self.status_bar = status_bar
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 6))
+        tk.Label(
+            status_bar,
+            textvariable=self.info_var,
+            bg=c["panel_alt"],
+            fg=c["muted"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.log_toggle_button = ttk.Button(
+            status_bar,
+            text="运行日志",
+            command=self._toggle_log_panel,
+            style="Ghost.TButton",
+            width=9,
+        )
+        self.log_toggle_button.pack(side=tk.RIGHT, padx=(8, 0))
 
-        self.lbl_rgb.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.lbl_fusion.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
-        self.lbl_ir.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        self.lbl_result.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
+        metrics = tk.Frame(self.root, bg=c["bg"])
+        metrics.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 6))
+        metric_specs = (
+            ("当前人数", self.current_count_metric_var, c["accent"]),
+            ("累计人数", self.unique_count_metric_var, "#8b5cf6"),
+            ("警戒进入", self.alert_count_metric_var, c["danger"]),
+            ("实时 FPS", self.fps_metric_var, c["success"]),
+            ("推理耗时", self.latency_metric_var, c["warning"]),
+            ("计算设备", self.device_metric_var, "#06b6d4"),
+        )
+        for index, spec in enumerate(metric_specs):
+            card = self._metric_card(metrics, *spec)
+            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 3, 0))
+            metrics.grid_columnconfigure(index, weight=1, uniform="metric")
+
+        self.main_pane = tk.PanedWindow(
+            self.root,
+            orient=tk.HORIZONTAL,
+            bg=c["bg"],
+            sashwidth=6,
+            sashrelief=tk.FLAT,
+            bd=0,
+        )
+        self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+        result_area = tk.Frame(self.main_pane, bg=c["bg"])
+        preview_area = tk.Frame(self.main_pane, bg=c["bg"])
+        self.main_pane.add(result_area, stretch="always", minsize=600)
+        self.main_pane.add(preview_area, stretch="never", minsize=280)
+
+        self.lbl_result = self._box(result_area, "检测结果  ·  双击放大")
+        self.lbl_result.pack(fill=tk.BOTH, expand=True)
+        self.lbl_rgb = self._box(preview_area, "可见光 RGB")
+        self.lbl_ir = self._box(preview_area, "红外 IR")
+        self.lbl_fusion = self._box(preview_area, "融合预览")
+        for frame in (self.lbl_rgb, self.lbl_ir, self.lbl_fusion):
+            frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
         self.lbl_result.inner_label.bind("<ButtonPress-1>", self._on_roi_press)
         self.lbl_result.inner_label.bind("<B1-Motion>", self._on_roi_drag)
         self.lbl_result.inner_label.bind("<ButtonRelease-1>", self._on_roi_release)
-
-        btm = tk.Frame(self.root, bg="#f0f0f0", pady=5)
-        btm.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Label(
-            btm,
-            textvariable=self.info_var,
-            bg="#f0f0f0",
-            font=("Consolas", 10),
-        ).pack(side=tk.LEFT, padx=10)
-
-        logf = tk.Frame(self.root, bg="#f8f8f8")
-        logf.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Label(logf, text="Log:", bg="#f8f8f8").pack(side=tk.LEFT, padx=6)
-        self.log_text = tk.Text(logf, height=5)
-        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=6)
-        self.log_text.insert("end", "GUI Ready.\n")
-        self.log_text.config(state="disabled")
+        self.root.after(120, self._set_initial_pane_position)
 
     def _box(self, parent, title):
-        f = tk.Frame(parent, bd=2, relief=tk.GROOVE, bg="#222")
-        title_label = tk.Label(f, text=title, bg="#efefef", font=("Arial", 10, "bold"))
+        c = self.COLORS
+        f = tk.Frame(
+            parent,
+            bg=c["image"],
+            highlightthickness=1,
+            highlightbackground=c["border"],
+        )
+        title_label = tk.Label(
+            f,
+            text=title,
+            bg=c["panel_alt"],
+            fg=c["text"],
+            anchor="w",
+            padx=10,
+            pady=5,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
         title_label.pack(side=tk.TOP, fill=tk.X)
-        l = tk.Label(f, text="No Image", bg="#333", fg="white")
+        l = tk.Label(f, text="暂无画面", bg=c["image"], fg=c["muted"])
         l.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        l.bind("<Double-Button-1>", lambda _event, widget=l, name=title: self._open_image_preview(widget, name))
         f.title_label = title_label
         f.inner_label = l
         return f
 
+    def _configure_styles(self):
+        c = self.COLORS
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            ".",
+            background=c["panel"],
+            foreground=c["text"],
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=c["bg"],
+            background=c["panel_alt"],
+            foreground=c["text"],
+            arrowcolor=c["text"],
+            bordercolor=c["border"],
+            lightcolor=c["border"],
+            darkcolor=c["border"],
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", c["bg"])],
+            foreground=[("readonly", c["text"])],
+            selectbackground=[("readonly", c["bg"])],
+            selectforeground=[("readonly", c["text"])],
+        )
+        style.configure("TNotebook", background=c["bg"], borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background=c["panel_alt"],
+            foreground=c["muted"],
+            padding=(18, 7),
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", c["accent"])],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Primary.TButton",
+            background=c["accent"],
+            foreground="#ffffff",
+            borderwidth=0,
+            padding=(10, 6),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", c["accent_hover"]), ("disabled", "#344055")],
+            foreground=[("disabled", "#7b8798")],
+        )
+        style.configure(
+            "Secondary.TButton",
+            background=c["panel_alt"],
+            foreground=c["text"],
+            bordercolor=c["border"],
+            padding=(9, 5),
+        )
+        style.map("Secondary.TButton", background=[("active", "#22304a")])
+        style.configure(
+            "Danger.TButton",
+            background="#7f1d1d",
+            foreground="#ffffff",
+            borderwidth=0,
+            padding=(9, 6),
+        )
+        style.map("Danger.TButton", background=[("active", c["danger"])])
+        style.configure(
+            "Ghost.TButton",
+            background=c["panel_alt"],
+            foreground=c["muted"],
+            borderwidth=0,
+            padding=(7, 4),
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", "#22304a")],
+            foreground=[("active", c["text"])],
+        )
+        style.configure(
+            "Toolbar.TCheckbutton",
+            background=c["panel_alt"],
+            foreground=c["text"],
+            indicatorcolor=c["bg"],
+        )
+        style.map(
+            "Toolbar.TCheckbutton",
+            background=[("active", c["panel_alt"])],
+            indicatorcolor=[("selected", c["accent"])],
+        )
+        self.root.option_add("*TCombobox*Listbox.background", c["bg"])
+        self.root.option_add("*TCombobox*Listbox.foreground", c["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+
+    def _control_group(self, parent, title):
+        c = self.COLORS
+        return tk.LabelFrame(
+            parent,
+            text=title,
+            bg=c["panel_alt"],
+            fg=c["muted"],
+            bd=0,
+            padx=6,
+            pady=4,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+
+    def _metric_card(self, parent, title, variable, accent):
+        c = self.COLORS
+        card = tk.Frame(
+            parent,
+            bg=c["panel"],
+            highlightthickness=1,
+            highlightbackground=c["border"],
+            padx=10,
+            pady=7,
+        )
+        tk.Frame(card, bg=accent, width=3).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
+        text = tk.Frame(card, bg=c["panel"])
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(
+            text,
+            text=title,
+            bg=c["panel"],
+            fg=c["muted"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 8),
+        ).pack(fill=tk.X)
+        tk.Label(
+            text,
+            textvariable=variable,
+            bg=c["panel"],
+            fg=c["text"],
+            anchor="w",
+            font=("Consolas", 12, "bold"),
+        ).pack(fill=tk.X)
+        return card
+
+    def _toggle_advanced_controls(self):
+        self._advanced_expanded = not self._advanced_expanded
+        if self._advanced_expanded:
+            self.advanced_frame.pack(fill=tk.X, pady=(7, 0))
+            self.advanced_toggle_button.config(text="高级参数 ▴")
+        else:
+            self.advanced_frame.pack_forget()
+            self.advanced_toggle_button.config(text="高级参数 ▾")
+
+    def _toggle_log_panel(self):
+        self._log_expanded = not self._log_expanded
+        if self._log_expanded:
+            self.log_panel.pack(
+                side=tk.BOTTOM,
+                fill=tk.X,
+                padx=10,
+                pady=(0, 6),
+                after=self.status_bar,
+            )
+            self.log_toggle_button.config(text="收起日志")
+        else:
+            self.log_panel.pack_forget()
+            self.log_toggle_button.config(text="运行日志")
+
+    def _set_initial_pane_position(self):
+        try:
+            self.main_pane.sash_place(0, max(650, int(self.main_pane.winfo_width() * 0.72)), 0)
+        except tk.TclError:
+            pass
+
+    def _set_run_state(self, text: str, level: str = "idle"):
+        variable = getattr(self, "run_state_var", None)
+        if variable is not None:
+            variable.set(text)
+        badge = getattr(self, "run_state_badge", None)
+        if badge is None:
+            return
+        color = {
+            "running": self.COLORS["success"],
+            "paused": self.COLORS["warning"],
+            "warning": self.COLORS["warning"],
+            "error": self.COLORS["danger"],
+        }.get(level, self.COLORS["accent"])
+        badge.config(bg=color)
+
+    def _set_count_metrics(self, current: int, unique: int, alerts: int):
+        self.count_var.set(f"当前:{current}  累计:{unique}  进入警戒区:{alerts}")
+        for attribute, value in (
+            ("current_count_metric_var", current),
+            ("unique_count_metric_var", unique),
+            ("alert_count_metric_var", alerts),
+        ):
+            variable = getattr(self, attribute, None)
+            if variable is not None:
+                variable.set(str(value))
+
+    def _refresh_source_readiness(self):
+        has_model = getattr(self, "current_model", None) is not None
+        channels = self._current_model_channels() if has_model else 0
+        has_rgb = getattr(self, "video_source", None) is not None
+        needs_ir = channels >= 6
+        has_ir = getattr(self, "ir_video_source", None) is not None
+        valid_pair = not needs_ir or (has_ir and self.video_source != self.ir_video_source)
+        ready = has_model and has_rgb and valid_pair
+
+        parts = [f"模型 {channels}ch" if has_model else "未加载模型"]
+        parts.append("RGB ✓" if has_rgb else "RGB 未选择")
+        if needs_ir:
+            parts.append("IR ✓" if has_ir else "IR 未选择")
+        source_variable = getattr(self, "source_status_var", None)
+        if source_variable is not None:
+            source_variable.set("  ·  ".join(parts))
+        button = getattr(self, "start_button", None)
+        if button is not None:
+            button.config(state=tk.NORMAL if ready and not getattr(self, "video_running", False) else tk.DISABLED)
+
+    def _on_video_stopped(self, error: str | None = None):
+        if error:
+            self._set_run_state("运行异常", "error")
+        else:
+            self._set_run_state("已停止", "idle")
+        self._refresh_source_readiness()
+
+    def _open_image_preview(self, image_label, title):
+        cv_img = self._last_view_images.get(image_label)
+        if cv_img is None:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=self.COLORS["image"])
+        dialog.geometry("1200x760")
+        try:
+            dialog.state("zoomed")
+        except tk.TclError:
+            pass
+        preview_label = tk.Label(dialog, bg=self.COLORS["image"])
+        preview_label.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            dialog,
+            text="双击或按 Esc 关闭",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            pady=5,
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
+        def render(_event=None):
+            image = to_uint8(cv_img)
+            height, width = image.shape[:2]
+            target_w = max(320, preview_label.winfo_width() - 10)
+            target_h = max(240, preview_label.winfo_height() - 10)
+            scale = min(target_w / max(width, 1), target_h / max(height, 1))
+            resized = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB) if resized.ndim == 2 else cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+            preview_label.config(image=photo)
+            preview_label.image = photo
+
+        preview_label.bind("<Configure>", render)
+        preview_label.bind("<Double-Button-1>", lambda _event: dialog.destroy())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.after(80, render)
+
     def _set_stream_titles(self, use_ir: bool):
-        self.lbl_rgb.title_label.config(text="Visible (RGB)")
-        self.lbl_ir.title_label.config(text="Infrared (IR)" if use_ir else "Infrared (未使用)")
-        self.lbl_fusion.title_label.config(text="Fusion View" if use_ir else "RGB Preview")
-        self.lbl_result.title_label.config(text="Result (红=Pred)")
+        self.lbl_rgb.title_label.config(text="可见光 RGB")
+        self.lbl_ir.title_label.config(text="红外 IR" if use_ir else "红外 IR（未使用）")
+        self.lbl_fusion.title_label.config(text="融合预览" if use_ir else "RGB 预览")
+        self.lbl_result.title_label.config(text="检测结果  ·  红框=预测  ·  双击放大")
 
     def browse_dataset(self):
         p = filedialog.askdirectory(title="请选择 LLVIP 根目录(包含 visible/infrared)")
@@ -779,6 +1317,7 @@ class MainApp:
                 self.current_model = model
                 self.model_combo["values"] = list(self.models.keys())
                 self.log(f"[GUI] 模型已存在，切换到: {name}")
+                self._refresh_source_readiness()
                 return
 
         model = YOLO(path)
@@ -802,6 +1341,7 @@ class MainApp:
 
         mode = "RGB/IR 6通道" if ch == 6 else "标准3通道"
         self.log(f"[GUI] 模型已加载: {name} ({mode})")
+        self._refresh_source_readiness()
 
     def _current_model_channels(self) -> int:
         name = self.model_var.get()
@@ -813,6 +1353,7 @@ class MainApp:
                 self.model_var.set(name)
                 self.current_model = model
                 self.log(f"[GUI] 已自动切换到{channels}通道模型: {name}")
+                self._refresh_source_readiness()
                 return True
         return False
 
@@ -829,16 +1370,16 @@ class MainApp:
             bundled_rgbt = BUNDLE_ROOT / "models" / "rgbt_best.pt"
             candidates = [bundled_rgbt] if bundled_rgbt.exists() else []
             if runs_dir.exists():
-                candidates.extend(runs_dir.rglob("best.pt"))
-            candidates.sort(
-                key=lambda p: (
-                    int("rgbt" in str(p).lower()),
-                    int("cbam" in str(p).lower()),
-                    int("ft8002" in str(p).lower()),
-                    p.stat().st_mtime,
-                ),
-                reverse=True,
-            )
+                run_candidates = list(runs_dir.rglob("best.pt"))
+                run_candidates.sort(
+                    key=lambda p: (
+                        int("rgbt" in str(p).lower()),
+                        int("cbam" in str(p).lower()),
+                        p.stat().st_mtime,
+                    ),
+                    reverse=True,
+                )
+                candidates.extend(run_candidates)
 
         for path in candidates:
             if not path.exists():
@@ -877,7 +1418,6 @@ class MainApp:
                 return (
                     int("rgbt" in s),
                     int("cbam" in s),
-                    int("ft8002" in s),
                     p.stat().st_mtime,
                 )
 
@@ -945,6 +1485,7 @@ class MainApp:
                 self.model_var.set(current_name)
                 return
             self.current_model = self.models[self.model_var.get()]
+            self._refresh_source_readiness()
             if restart_video:
                 self.start_video_inference()
             else:
@@ -1161,9 +1702,11 @@ class MainApp:
             rx1, ry1, rx2, ry2 = alert_roi
             for detection in detections:
                 x1, y1, x2, y2 = detection["box"]
-                center_x = ((x1 + x2) / 2) / max(width, 1)
-                center_y = ((y1 + y2) / 2) / max(height, 1)
-                if rx1 <= center_x <= rx2 and ry1 <= center_y <= ry2:
+                # Ground-plane ROIs (doors, sidewalks, fence lines) should use the
+                # pedestrian foot point; the box centre tends to trigger too early.
+                foot_x = ((x1 + x2) / 2) / max(width, 1)
+                foot_y = y2 / max(height, 1)
+                if rx1 <= foot_x <= rx2 and ry1 <= foot_y <= ry2:
                     detection["inside_alert_roi"] = True
                     track_id = detection.get("track_id")
                     if track_id is None:
@@ -1198,8 +1741,10 @@ class MainApp:
         self._anonymous_scene_count = current_count
         unique_count = self._anonymous_seen_count
         self._post_ui(
-            self.count_var.set,
-            f"当前:{len(detections)}  累计:{unique_count}  进入警戒区:{self._alert_entry_count}",
+            self._set_count_metrics,
+            len(detections),
+            unique_count,
+            self._alert_entry_count,
         )
         return inside_ids, trigger, unique_count
 
@@ -1314,6 +1859,14 @@ class MainApp:
             f"设备:{self.active_device.label} | Fuse:{fuse_ms:.1f}ms "
             f"Det:{det_ms:.1f}ms{fps_text} | GT:{gt_count} Pred:{pred_count}"
         )
+        if hasattr(self, "fps_metric_var"):
+            self.fps_metric_var.set(f"{runtime_fps:.1f}" if runtime_fps > 0 else "--")
+        if hasattr(self, "latency_metric_var"):
+            self.latency_metric_var.set(f"{det_ms:.1f} ms" if det_ms > 0 else "--")
+        if time.monotonic() < self._alert_flash_until:
+            self._set_run_state("警戒触发", "warning")
+        elif self.video_running:
+            self._set_run_state("已暂停" if self.video_paused else "检测中", "paused" if self.video_paused else "running")
 
     def _schedule_video_ui_update(self, *args):
         with self._video_ui_lock:
@@ -1321,8 +1874,10 @@ class MainApp:
 
     def _show_image(self, cv_img, tk_label):
         if cv_img is None:
-            tk_label.config(text="No Image", image="")
+            tk_label.config(text="暂无画面", image="")
+            self._last_view_images.pop(tk_label, None)
             return
+        self._last_view_images[tk_label] = cv_img
         cv_img = to_uint8(cv_img)
         ww, wh = max(160, tk_label.winfo_width() - 4), max(120, tk_label.winfo_height() - 4)
         h, w = cv_img.shape[:2]
@@ -1347,8 +1902,9 @@ class MainApp:
         self.latest_result_frame = None
         self.latest_result_base_frame = None
         for frame in [self.lbl_rgb, self.lbl_ir, self.lbl_fusion, self.lbl_result]:
-            frame.inner_label.config(text="No Image", image="")
+            frame.inner_label.config(text="暂无画面", image="")
             self._img_refs.pop(frame.inner_label, None)
+            self._last_view_images.pop(frame.inner_label, None)
             self._display_geometry.pop(frame.inner_label, None)
 
     def open_visible_video(self):
@@ -1367,10 +1923,8 @@ class MainApp:
             self.video_source = p
             self.video_backend = None
             self.log(f"[GUI] 可见光视频: {p}")
-            if self.current_model is not None and self._current_model_channels() < 6:
-                self.start_video_inference()
-            elif self.ir_video_source is not None:
-                self.start_video_inference()
+            self._set_run_state("输入已选择", "idle")
+            self._refresh_source_readiness()
 
     def open_ir_video(self):
         p = filedialog.askopenfilename(
@@ -1388,8 +1942,8 @@ class MainApp:
             self.ir_video_source = p
             self.ir_video_backend = None
             self.log(f"[GUI] 红外视频: {p}")
-            if self.video_source is not None:
-                self.start_video_inference()
+            self._set_run_state("输入已选择", "idle")
+            self._refresh_source_readiness()
 
     def open_auto_camera(self):
         if self.camera_scan_worker and self.camera_scan_worker.is_alive():
@@ -1400,6 +1954,7 @@ class MainApp:
         self._camera_scan_generation += 1
         generation = self._camera_scan_generation
         self.info_var.set("正在扫描摄像头...")
+        self._set_run_state("扫描摄像头", "warning")
         self.log("[CAM] 开始自动识别摄像头")
         self.camera_scan_worker = threading.Thread(
             target=self._scan_cameras,
@@ -1419,6 +1974,7 @@ class MainApp:
         if generation != self._camera_scan_generation:
             return
         self.info_var.set("摄像头扫描失败")
+        self._set_run_state("扫描失败", "error")
         self.log(f"[CAM] 摄像头扫描失败: {error}")
         messagebox.showerror("摄像头错误", f"自动识别摄像头失败：\n{error}")
 
@@ -1429,6 +1985,7 @@ class MainApp:
             return
         if not devices:
             self.info_var.set("未检测到可用摄像头")
+            self._set_run_state("未发现摄像头", "warning")
             messagebox.showwarning(
                 "未检测到摄像头",
                 "没有检测到可用摄像头。请检查Windows相机权限、连接状态，或关闭正在占用摄像头的程序。",
@@ -1473,7 +2030,8 @@ class MainApp:
                 f"[CAM] 自动使用{source_type}摄像头: {setup.rgb.name}({setup.rgb.index}) | "
                 f"3通道模型:{self.model_var.get()}"
             )
-        self.start_video_inference()
+        self._set_run_state("摄像头已就绪", "idle")
+        self._refresh_source_readiness()
 
     def open_rgbt_cameras(self):
         if not self._wait_for_image_worker() or not self.stop_video():
@@ -1515,7 +2073,8 @@ class MainApp:
             f"[CAM] 可见光摄像头: {rgb_camera_id} | 红外摄像头: {ir_camera_id} | "
             f"6通道模型: {self.model_var.get()}"
         )
-        self.start_video_inference()
+        self._set_run_state("双摄已就绪", "idle")
+        self._refresh_source_readiness()
 
     def toggle_pause_video(self):
         if self.video_running:
@@ -1526,6 +2085,7 @@ class MainApp:
                 self._fps_times.clear()
                 self._fps_ema = 0.0
             self.log("[GUI] 视频已暂停" if self.video_paused else "[GUI] 视频继续播放")
+            self._set_run_state("已暂停" if self.video_paused else "检测中", "paused" if self.video_paused else "running")
 
     def stop_video(self, wait_timeout: float | None = 10.0) -> bool:
         self.video_running = False
@@ -1538,6 +2098,8 @@ class MainApp:
             return False
         self.video_worker = None
         self._release_video_io()
+        if hasattr(self, "run_state_var"):
+            self._on_video_stopped()
         return True
 
     def _release_video_io(self):
@@ -1648,9 +2210,12 @@ class MainApp:
             return
         self.video_model_channels = ch
         self.video_model_name = self.model_var.get()
-        self.video_predict_settings = predict_settings
         self.video_speed = video_speed
         self.video_performance_mode = self._performance_key()
+        self.video_predict_settings = self._video_profile_settings(
+            predict_settings,
+            self.video_performance_mode,
+        )
         self.video_tracking_enabled = bool(self.tracking_var.get())
         self.video_alert_enabled = bool(self.alert_var.get())
         self.video_ir_frame_offset = int(self.settings.get("ir_frame_offset", 0))
@@ -1667,6 +2232,8 @@ class MainApp:
         self._reset_tracking_state()
         self._save_settings()
         self.video_running = True
+        self._set_run_state("检测中", "running")
+        self._refresh_source_readiness()
         with self._video_ui_lock:
             self._video_ui_payload = None
         self._fps_ema = 0.0
@@ -1760,9 +2327,13 @@ class MainApp:
                     fi = self.fusion_engine.shift_ir(fi, *self.video_ir_shift)
                     ir_show = to_uint8(fi if fi.ndim == 3 else cv2.cvtColor(fi, cv2.COLOR_GRAY2BGR))
                     if should_infer:
+                        preprocess_max_side = self.IR_PREPROCESS_MAX_SIDE[
+                            self.video_performance_mode
+                        ]
                         ir_preprocessed = self.fusion_engine.preprocess_ir(
                             fi,
-                            realtime=self.video_performance_mode != "quality",
+                            realtime=preprocess_max_side is not None,
+                            realtime_max_side=preprocess_max_side or max(fi.shape[:2]),
                         )
                         fused = self.fusion_engine.for_display_with_preprocessed_ir(fv, ir_preprocessed)
                         model_input = self.fusion_engine.for_model_with_preprocessed_ir(fv, ir_preprocessed)
@@ -1874,6 +2445,7 @@ class MainApp:
                             if not rv_skip or not ri_skip:
                                 break
         except Exception as e:
+            error_message = str(e)
             if self.video_running:
                 self.log(f"[GUI] 视频推理失败: {e}")
         finally:
@@ -1882,6 +2454,7 @@ class MainApp:
             self._release_video_io()
             if self.video_worker is threading.current_thread():
                 self.video_worker = None
+            self._post_ui(self._on_video_stopped, locals().get("error_message"))
 
     def save_current_result(self):
         if self.latest_result_frame is None:
